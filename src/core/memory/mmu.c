@@ -23,6 +23,7 @@
 #include "mbc.h"
 #include "gb_ppu.h"
 #include "input.h"
+#include "../audio/apu.h"
 
 /*
  * I/O Register Addresses (Section 2.13.1)
@@ -236,6 +237,10 @@ uint8_t mmu_read(void *ctx, uint16_t addr) {
                 return mmu->io[reg];
 
             default:
+                /* Sound registers: NR10-NR52 (0x10-0x26) and Wave RAM (0x30-0x3F) */
+                if (mmu->apu && ((reg >= 0x10 && reg <= 0x26) || (reg >= 0x30 && reg <= 0x3F))) {
+                    return apu_read(mmu->apu, addr);
+                }
                 return mmu->io[reg];
         }
     }
@@ -375,6 +380,10 @@ void mmu_write(void *ctx, uint16_t addr, uint8_t val) {
                 break;
 
             default:
+                /* Sound registers: NR10-NR52 (0x10-0x26) and Wave RAM (0x30-0x3F) */
+                if (mmu->apu && ((reg >= 0x10 && reg <= 0x26) || (reg >= 0x30 && reg <= 0x3F))) {
+                    apu_write(mmu->apu, addr, val);
+                }
                 mmu->io[reg] = val;
                 break;
         }
