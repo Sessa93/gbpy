@@ -21,6 +21,8 @@
 
 #include "mmu.h"
 #include "mbc.h"
+#include "gb_ppu.h"
+#include "input.h"
 
 /*
  * I/O Register Addresses (Section 2.13.1)
@@ -215,9 +217,27 @@ uint8_t mmu_read(void *ctx, uint16_t addr) {
     if (addr < 0xFF80) {
         uint8_t reg = addr & 0x7F;
 
-        /* LY register (FF44) is read-only PPU scanline counter */
-        /* Specific register reads are delegated to subsystems */
-        return mmu->io[reg];
+        switch (reg) {
+            case IO_P1:
+                /* Joypad register: combine select bits with button state */
+                if (mmu->input) {
+                    return input_read(mmu->input);
+                }
+                return mmu->io[reg];
+
+            case IO_BCPS:
+            case IO_BCPD:
+            case IO_OCPS:
+            case IO_OCPD:
+                /* GBC palette registers: delegate to PPU */
+                if (mmu->mode == GBPY_MODE_GBC && mmu->ppu) {
+                    return gb_ppu_read_palette(mmu->ppu, addr);
+                }
+                return mmu->io[reg];
+
+            default:
+                return mmu->io[reg];
+        }
     }
 
     /* FF80-FFFE: HRAM */
@@ -330,9 +350,28 @@ void mmu_write(void *ctx, uint16_t addr, uint8_t val) {
                 mmu->io[reg] = val;
                 break;
 
+            case IO_P1:
+                /* Joypad register: write select bits */
+                if (mmu->input) {
+                    input_write(mmu->input, val);
+                }
+                mmu->io[reg] = val;
+                break;
+
             case IO_DIV:
                 /* Writing any value to DIV resets it to 0 (Section 2.10.1) */
                 mmu->io[reg] = 0;
+                break;
+
+            case IO_BCPS:
+            case IO_BCPD:
+            case IO_OCPS:
+            case IO_OCPD:
+                /* GBC palette registers: delegate to PPU */
+                if (mmu->mode == GBPY_MODE_GBC && mmu->ppu) {
+                    gb_ppu_write_palette(mmu->ppu, addr, val);
+                }
+                mmu->io[reg] = val;
                 break;
 
             default:
