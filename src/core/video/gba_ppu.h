@@ -64,8 +64,8 @@ typedef struct GbaMemory GbaMemory;
 
 /* OAM attribute bits */
 #define OBJ_ATTR0_Y(v)       ((v) & 0xFF)
-#define OBJ_ATTR0_MODE(v)    (((v) >> 8) & 3)  /* 0=normal, 1=semi-trans, 2=obj-window, 3=prohibited */
-#define OBJ_ATTR0_GFX(v)     (((v) >> 10) & 3) /* 0=normal, 1=affine, 2=disabled, 3=affine double */
+#define OBJ_ATTR0_MODE(v)    (((v) >> 10) & 3) /* 0=normal, 1=semi-trans, 2=obj-window, 3=prohibited */
+#define OBJ_ATTR0_GFX(v)     (((v) >> 8) & 3)  /* 0=normal, 1=affine, 2=disabled, 3=affine double */
 #define OBJ_ATTR0_MOSAIC(v)  (((v) >> 12) & 1)
 #define OBJ_ATTR0_COLOR(v)   (((v) >> 13) & 1) /* 0=16/16, 1=256/1 */
 #define OBJ_ATTR0_SHAPE(v)   (((v) >> 14) & 3)
@@ -124,6 +124,7 @@ typedef struct GbaPPU {
     uint8_t  obj_prio[GBA_SCREEN_W];       /* Sprite priority */
     bool     obj_pixel_valid[GBA_SCREEN_W];
     bool     obj_semi_trans[GBA_SCREEN_W]; /* Semi-transparent flag */
+    bool     obj_is_window[GBA_SCREEN_W];  /* OBJ window mask flag */
 
     /* Frame ready flag */
     bool frame_ready;

@@ -75,6 +75,7 @@ void gb_ppu_reset(GbPPU *ppu) {
     ppu->line = 0;
     ppu->window_line = 0;
     ppu->frame_ready = false;
+    ppu->stat_irq_line = false;
     memset(ppu->framebuffer, 0, sizeof(ppu->framebuffer));
 }
 
@@ -394,6 +395,7 @@ uint8_t gb_ppu_step(GbPPU *ppu, uint32_t cycles) {
         ppu->line = 0;
         ppu->io[IO_LY] = 0;
         ppu->io[IO_STAT] = (ppu->io[IO_STAT] & 0xFC);
+        ppu->stat_irq_line = false;
         return 0;
     }
 
@@ -414,11 +416,6 @@ uint8_t gb_ppu_step(GbPPU *ppu, uint32_t cycles) {
 
                 /* Render the scanline */
                 gb_ppu_render_scanline(ppu);
-
-                /* STAT Mode 0 interrupt */
-                if (ppu->io[IO_STAT] & STAT_HBLANK_INT) {
-                    interrupts |= INT_LCD_BIT;
-                }
             }
             break;
 
@@ -428,30 +425,13 @@ uint8_t gb_ppu_step(GbPPU *ppu, uint32_t cycles) {
                 ppu->line++;
                 ppu->io[IO_LY] = ppu->line;
 
-                /* Check LYC coincidence */
-                if (ppu->line == ppu->io[IO_LYC]) {
-                    ppu->io[IO_STAT] |= STAT_COINCIDENCE;
-                    if (ppu->io[IO_STAT] & STAT_LYC_INT) {
-                        interrupts |= INT_LCD_BIT;
-                    }
-                } else {
-                    ppu->io[IO_STAT] &= ~STAT_COINCIDENCE;
-                }
-
                 if (ppu->line >= SCANLINES_VISIBLE) {
                     /* Enter VBlank */
                     ppu->mode = PPU_MODE_VBLANK;
                     ppu->frame_ready = true;
                     interrupts |= INT_VBLANK_BIT;
-
-                    if (ppu->io[IO_STAT] & STAT_VBLANK_INT) {
-                        interrupts |= INT_LCD_BIT;
-                    }
                 } else {
                     ppu->mode = PPU_MODE_OAM_SCAN;
-                    if (ppu->io[IO_STAT] & STAT_OAM_INT) {
-                        interrupts |= INT_LCD_BIT;
-                    }
                 }
             }
             break;
@@ -462,25 +442,12 @@ uint8_t gb_ppu_step(GbPPU *ppu, uint32_t cycles) {
                 ppu->line++;
                 ppu->io[IO_LY] = ppu->line;
 
-                if (ppu->line == ppu->io[IO_LYC]) {
-                    ppu->io[IO_STAT] |= STAT_COINCIDENCE;
-                    if (ppu->io[IO_STAT] & STAT_LYC_INT) {
-                        interrupts |= INT_LCD_BIT;
-                    }
-                } else {
-                    ppu->io[IO_STAT] &= ~STAT_COINCIDENCE;
-                }
-
                 if (ppu->line >= SCANLINES_TOTAL) {
                     /* New frame */
                     ppu->line = 0;
                     ppu->window_line = 0;
                     ppu->io[IO_LY] = 0;
                     ppu->mode = PPU_MODE_OAM_SCAN;
-
-                    if (ppu->io[IO_STAT] & STAT_OAM_INT) {
-                        interrupts |= INT_LCD_BIT;
-                    }
                 }
             }
             break;
@@ -488,6 +455,37 @@ uint8_t gb_ppu_step(GbPPU *ppu, uint32_t cycles) {
 
     /* Update STAT mode bits */
     ppu->io[IO_STAT] = (ppu->io[IO_STAT] & 0xFC) | (ppu->mode & 0x03);
+
+    /* Update LYC coincidence flag */
+    if (ppu->line == ppu->io[IO_LYC]) {
+        ppu->io[IO_STAT] |= STAT_COINCIDENCE;
+    } else {
+        ppu->io[IO_STAT] &= ~STAT_COINCIDENCE;
+    }
+
+    /* STAT interrupt line: combines all enabled STAT interrupt sources.
+     * The actual STAT interrupt only fires on the RISING EDGE of this
+     * combined signal (interrupt blocking). */
+    uint8_t stat = ppu->io[IO_STAT];
+    bool new_stat_line = false;
+
+    if ((stat & STAT_HBLANK_INT) && ppu->mode == PPU_MODE_HBLANK)
+        new_stat_line = true;
+    if ((stat & STAT_VBLANK_INT) && ppu->mode == PPU_MODE_VBLANK)
+        new_stat_line = true;
+    if ((stat & STAT_OAM_INT) && ppu->mode == PPU_MODE_OAM_SCAN)
+        new_stat_line = true;
+    /* OAM STAT interrupt also fires at VBlank start (line 144) - hardware quirk */
+    if ((stat & STAT_OAM_INT) && ppu->mode == PPU_MODE_VBLANK && ppu->line == SCANLINES_VISIBLE)
+        new_stat_line = true;
+    if ((stat & STAT_LYC_INT) && (stat & STAT_COINCIDENCE))
+        new_stat_line = true;
+
+    /* Rising edge detection: fire interrupt only on 0→1 transition */
+    if (new_stat_line && !ppu->stat_irq_line) {
+        interrupts |= INT_LCD_BIT;
+    }
+    ppu->stat_irq_line = new_stat_line;
 
     return interrupts;
 }

@@ -6,12 +6,17 @@
 
 #include "gba_memory.h"
 #include "../cpu/arm7tdmi.h"
+#include "../audio/gba_apu.h"
+#include <stdio.h>
 
 /* ---------- Init/Reset ---------- */
 
 void gba_mem_init(GbaMemory *mem) {
     memset(mem, 0, sizeof(GbaMemory));
     mem->keyinput = 0x03FF; /* All buttons released (active low) */
+    mem->io[0x300] = 0x01;  /* POSTFLG: BIOS startup finished */
+    *(uint16_t *)&mem->io[0x088] = 0x0200; /* SOUNDBIAS default after BIOS */
+    mem->bios_readable = true;
 }
 
 void gba_mem_reset(GbaMemory *mem) {
@@ -36,6 +41,8 @@ void gba_mem_reset(GbaMemory *mem) {
     mem->ppu = (GbaPPU *)ppu;
     mem->apu = (GbaAPU *)apu;
     mem->keyinput = 0x03FF;
+    mem->io[0x300] = 0x01;  /* POSTFLG: BIOS startup finished */
+    *(uint16_t *)&mem->io[0x088] = 0x0200; /* SOUNDBIAS default after BIOS */
     mem->ie = 0;
     mem->ifl = 0;
     mem->ime = 0;
@@ -109,6 +116,11 @@ static uint16_t io_read16(GbaMemory *mem, uint32_t offset) {
 }
 
 static void io_write16(GbaMemory *mem, uint32_t offset, uint16_t val) {
+    static int io_trace = 0;
+    if (io_trace < 200 && (offset == 0x000 || offset == 0x200 || offset == 0x202 || offset == 0x208)) {
+        fprintf(stderr, "[IO_W16] offset=0x%03X val=0x%04X\n", offset, val);
+        io_trace++;
+    }
     switch (offset) {
         /* Display */
         case 0x000: *(uint16_t *)&mem->io[0x000] = val; return;
@@ -152,18 +164,40 @@ static void io_write16(GbaMemory *mem, uint32_t offset, uint16_t val) {
             *(uint16_t *)&mem->io[offset] = val;
             return;
 
-        /* Sound registers */
+        /* Sound registers — update APU state for legacy channels */
         case 0x060: case 0x062: case 0x064: case 0x068:
         case 0x06C: case 0x070: case 0x072: case 0x074:
-        case 0x078: case 0x07C: case 0x080: case 0x082:
-        case 0x084: case 0x088:
+        case 0x078: case 0x07C: case 0x080: case 0x084:
+        case 0x088:
             *(uint16_t *)&mem->io[offset] = val;
+            if (mem->apu) {
+                gba_apu_write_reg(mem->apu, offset, val & 0xFF);
+                gba_apu_write_reg(mem->apu, offset + 1, (val >> 8) & 0xFF);
+            }
             return;
 
-        /* Sound FIFO */
+        /* SOUNDCNT_H — handle FIFO reset bits */
+        case 0x082:
+            if (mem->apu) {
+                if (val & (1 << 11)) gba_fifo_reset(&mem->apu->fifo_a);
+                if (val & (1 << 15)) gba_fifo_reset(&mem->apu->fifo_b);
+            }
+            /* Clear write-only reset bits before storing */
+            *(uint16_t *)&mem->io[0x082] = val & ~((1 << 11) | (1 << 15));
+            return;
+
+        /* Sound FIFO — push samples into APU ring buffers */
         case 0x0A0: case 0x0A2: /* FIFO_A */
+            if (mem->apu) {
+                gba_fifo_write(&mem->apu->fifo_a, (int8_t)(val & 0xFF));
+                gba_fifo_write(&mem->apu->fifo_a, (int8_t)((val >> 8) & 0xFF));
+            }
+            return;
         case 0x0A4: case 0x0A6: /* FIFO_B */
-            *(uint16_t *)&mem->io[offset] = val;
+            if (mem->apu) {
+                gba_fifo_write(&mem->apu->fifo_b, (int8_t)(val & 0xFF));
+                gba_fifo_write(&mem->apu->fifo_b, (int8_t)((val >> 8) & 0xFF));
+            }
             return;
 
         /* DMA 0 */
@@ -294,7 +328,23 @@ static void io_write16(GbaMemory *mem, uint32_t offset, uint16_t val) {
         /* Interrupts */
         case 0x200: mem->ie = val; return;
         case 0x202: mem->ifl &= ~val; return; /* Write 1 to acknowledge */
-        case 0x208: mem->ime = val & 1; return;
+        case 0x208: {
+            uint16_t old_ime = mem->ime;
+            mem->ime = val & 1;
+            static int ime_trace = 0;
+            if (ime_trace < 20) {
+                fprintf(stderr, "[IME] %d -> %d (val=0x%04X)\n", old_ime, mem->ime, val);
+                ime_trace++;
+            }
+            if (old_ime && !mem->ime) {
+                static int ime_clr = 0;
+                if (ime_clr < 5) {
+                    fprintf(stderr, "[IME_CLR] IME cleared! val=0x%04X\n", val);
+                    ime_clr++;
+                }
+            }
+            return;
+        }
 
         /* Wait control */
         case 0x204: mem->waitcnt = val; return;
@@ -333,12 +383,12 @@ static void io_write8(GbaMemory *mem, uint32_t offset, uint8_t val) {
 
     /* Sound FIFO_A (0x4000A0-0x4000A3) */
     if (offset >= 0xA0 && offset <= 0xA3) {
-        mem->io[offset] = val;
+        if (mem->apu) gba_fifo_write(&mem->apu->fifo_a, (int8_t)val);
         return;
     }
     /* Sound FIFO_B (0x4000A4-0x4000A7) */
     if (offset >= 0xA4 && offset <= 0xA7) {
-        mem->io[offset] = val;
+        if (mem->apu) gba_fifo_write(&mem->apu->fifo_b, (int8_t)val);
         return;
     }
 
@@ -351,6 +401,152 @@ static void io_write8(GbaMemory *mem, uint32_t offset, uint8_t val) {
         old = (old & 0xFF00) | val;
     }
     io_write16(mem, aligned, old);
+}
+
+/* ---------- Flash state machine ---------- */
+
+#define FLASH_STATE_READY   0
+#define FLASH_STATE_CMD1    1  /* Received 0xAA at 0x5555 */
+#define FLASH_STATE_CMD2    2  /* Received 0x55 at 0x2AAA */
+#define FLASH_STATE_ERASE1  3  /* Received 0x80 erase command, waiting for 0xAA */
+#define FLASH_STATE_ERASE2  4  /* Received 0xAA in erase sequence */
+#define FLASH_STATE_ERASE3  5  /* Received 0x55 in erase sequence */
+
+static uint8_t flash_read(GbaMemory *mem, uint32_t addr) {
+    uint16_t offset = addr & 0xFFFF;
+
+    if (mem->flash_id_mode) {
+        if (offset == 0x0000) return mem->flash_manufacturer;
+        if (offset == 0x0001) return mem->flash_device;
+        return 0;
+    }
+
+    /* Normal read: apply bank offset for 128KB Flash */
+    uint32_t flash_addr = (uint32_t)mem->flash_bank * 0x10000 + offset;
+    if (flash_addr < mem->sram_size)
+        return mem->sram[flash_addr];
+    return 0xFF;
+}
+
+static void flash_write(GbaMemory *mem, uint32_t addr, uint8_t val) {
+    uint16_t offset = addr & 0xFFFF;
+
+    /* Single byte write (after 0xA0 program command) */
+    if (mem->flash_write_enable) {
+        uint32_t flash_addr = (uint32_t)mem->flash_bank * 0x10000 + offset;
+        if (flash_addr < mem->sram_size)
+            mem->sram[flash_addr] = val;
+        mem->flash_write_enable = false;
+        mem->flash_state = FLASH_STATE_READY;
+        return;
+    }
+
+    /* Bank select (after 0xB0 command): write bank number to 0x0000 */
+    if (mem->flash_state == FLASH_STATE_CMD2 && offset == 0x0000 &&
+        mem->sram_size > 0x10000) {
+        /* This actually happens after a specific sequence, but for simplicity: */
+    }
+
+    /* Command sequence processing */
+    switch (mem->flash_state) {
+        case FLASH_STATE_READY:
+            if (offset == 0x5555 && val == 0xAA) {
+                mem->flash_state = FLASH_STATE_CMD1;
+            }
+            break;
+
+        case FLASH_STATE_CMD1:
+            if (offset == 0x2AAA && val == 0x55) {
+                mem->flash_state = FLASH_STATE_CMD2;
+            } else {
+                mem->flash_state = FLASH_STATE_READY;
+            }
+            break;
+
+        case FLASH_STATE_CMD2:
+            if (offset == 0x5555) {
+                switch (val) {
+                    case 0x90: /* Enter ID mode */
+                        mem->flash_id_mode = true;
+                        mem->flash_state = FLASH_STATE_READY;
+                        break;
+                    case 0xF0: /* Exit ID mode / reset */
+                        mem->flash_id_mode = false;
+                        mem->flash_state = FLASH_STATE_READY;
+                        break;
+                    case 0x80: /* Erase command (first part) */
+                        mem->flash_state = FLASH_STATE_ERASE1;
+                        break;
+                    case 0xA0: /* Write single byte */
+                        mem->flash_write_enable = true;
+                        mem->flash_state = FLASH_STATE_READY;
+                        break;
+                    case 0xB0: /* Bank switch (128KB Flash) */
+                        /* Next write to 0x0000 selects the bank */
+                        mem->flash_state = FLASH_STATE_READY;
+                        /* Actually, bank byte comes to address 0x0000 next */
+                        if (mem->sram_size > 0x10000) {
+                            /* Wait for bank number at 0x0000 - handle inline */
+                            /* The real Flash expects write to 0x0000 after B0 cmd */
+                            /* We set a flag and catch it on next write */
+                            mem->flash_state = 0xB0; /* special: bank select pending */
+                        }
+                        break;
+                    default:
+                        mem->flash_state = FLASH_STATE_READY;
+                        break;
+                }
+            } else {
+                mem->flash_state = FLASH_STATE_READY;
+            }
+            break;
+
+        case FLASH_STATE_ERASE1:
+            if (offset == 0x5555 && val == 0xAA) {
+                mem->flash_state = FLASH_STATE_ERASE2;
+            } else {
+                mem->flash_state = FLASH_STATE_READY;
+            }
+            break;
+
+        case FLASH_STATE_ERASE2:
+            if (offset == 0x2AAA && val == 0x55) {
+                mem->flash_state = FLASH_STATE_ERASE3;
+            } else {
+                mem->flash_state = FLASH_STATE_READY;
+            }
+            break;
+
+        case FLASH_STATE_ERASE3:
+            if (offset == 0x5555 && val == 0x10) {
+                /* Erase entire chip */
+                memset(mem->sram, 0xFF, mem->sram_size);
+            } else if (val == 0x30) {
+                /* Erase 4KB sector at offset */
+                uint32_t sector = (uint32_t)mem->flash_bank * 0x10000 +
+                                  (offset & 0xF000);
+                if (sector + 0x1000 <= mem->sram_size)
+                    memset(&mem->sram[sector], 0xFF, 0x1000);
+            }
+            mem->flash_state = FLASH_STATE_READY;
+            break;
+
+        case 0xB0: /* Bank select pending */
+            if (offset == 0x0000) {
+                mem->flash_bank = val & 1;
+            }
+            mem->flash_state = FLASH_STATE_READY;
+            break;
+
+        default:
+            mem->flash_state = FLASH_STATE_READY;
+            break;
+    }
+
+    /* Handle terminate ID mode from any state */
+    if (val == 0xF0) {
+        mem->flash_id_mode = false;
+    }
 }
 
 /* ---------- Memory read ---------- */
@@ -402,7 +598,9 @@ uint8_t gba_mem_read8(void *ctx, uint32_t addr) {
             return (rom_addr >> 1) & 0xFF; /* Open bus */
         }
 
-        case 0x0E: case 0x0F: /* SRAM */
+        case 0x0E: case 0x0F: /* SRAM / Flash */
+            if (mem->flash_is_flash)
+                return flash_read(mem, addr);
             if ((addr & 0xFFFF) < mem->sram_size)
                 return mem->sram[addr & 0xFFFF];
             return 0xFF;
@@ -538,6 +736,10 @@ void gba_mem_write8(void *ctx, uint32_t addr, uint8_t val) {
         }
         case 0x07: return; /* OAM: 8-bit writes ignored */
         case 0x0E: case 0x0F:
+            if (mem->flash_is_flash) {
+                flash_write(mem, addr, val);
+                return;
+            }
             if ((addr & 0xFFFF) < mem->sram_size)
                 mem->sram[addr & 0xFFFF] = val;
             return;
@@ -583,6 +785,15 @@ void gba_mem_write32(void *ctx, uint32_t addr, uint32_t val) {
         case 0x04:
             if ((addr & 0xFFFF) < 0x400) {
                 uint32_t off = addr & 0x3FC;
+                /* FIFO writes must go as full 32-bit words to the APU */
+                if (off == 0x0A0 && mem->apu) {
+                    gba_fifo_write32(&mem->apu->fifo_a, val);
+                    return;
+                }
+                if (off == 0x0A4 && mem->apu) {
+                    gba_fifo_write32(&mem->apu->fifo_b, val);
+                    return;
+                }
                 io_write16(mem, off, val & 0xFFFF);
                 io_write16(mem, off + 2, val >> 16);
             }
@@ -612,14 +823,23 @@ static void dma_run_channel(GbaMemory *mem, int ch) {
     uint8_t dst_ctrl = (ctrl >> 5) & 3;
     uint8_t src_ctrl = (ctrl >> 7) & 3;
     bool word_size = (ctrl >> 10) & 1; /* 0=16bit, 1=32bit */
+    uint8_t timing = (ctrl >> 12) & 3;
     uint32_t step = word_size ? 4 : 2;
+
+    /* Sound FIFO DMA (DMA1/2 with SPECIAL timing): always 4 words, 32-bit */
+    uint32_t count = dma->internal_count;
+    if (timing == DMA_TIMING_SPECIAL && (ch == 1 || ch == 2)) {
+        count = 4;
+        word_size = true;
+        step = 4;
+    }
 
     int32_t src_inc = (src_ctrl == DMA_SRC_DEC) ? -(int32_t)step :
                       (src_ctrl == DMA_SRC_FIXED) ? 0 : (int32_t)step;
     int32_t dst_inc = (dst_ctrl == DMA_DEST_DEC) ? -(int32_t)step :
                       (dst_ctrl == DMA_DEST_FIXED) ? 0 : (int32_t)step;
 
-    for (uint32_t i = 0; i < dma->internal_count; i++) {
+    for (uint32_t i = 0; i < count; i++) {
         if (word_size) {
             uint32_t val = gba_mem_read32(mem, dma->internal_src);
             gba_mem_write32(mem, dma->internal_dst, val);
@@ -638,7 +858,6 @@ static void dma_run_channel(GbaMemory *mem, int ch) {
 
     /* Repeat? */
     bool repeat = (ctrl >> 9) & 1;
-    uint8_t timing = (ctrl >> 12) & 3;
     if (repeat && timing != DMA_TIMING_NOW) {
         dma->internal_count = dma->count ? dma->count : (ch == 3 ? 0x10000 : 0x4000);
         if (dst_ctrl == DMA_DEST_RELOAD) {
@@ -691,6 +910,8 @@ void gba_timer_step(GbaMemory *mem, uint32_t cycles) {
                     if (t->control & TIMER_IRQ) {
                         gba_request_interrupt(mem, GBA_INT_TIMER0 << i);
                     }
+                    /* Notify APU for DMA sound */
+                    if (mem->apu) gba_apu_timer_overflow(mem->apu, i);
                 }
             }
             continue;
@@ -709,6 +930,8 @@ void gba_timer_step(GbaMemory *mem, uint32_t cycles) {
                 if (t->control & TIMER_IRQ) {
                     gba_request_interrupt(mem, GBA_INT_TIMER0 << i);
                 }
+                /* Notify APU for DMA sound */
+                if (mem->apu) gba_apu_timer_overflow(mem->apu, i);
             }
             (void)old;
         }
@@ -718,7 +941,25 @@ void gba_timer_step(GbaMemory *mem, uint32_t cycles) {
 /* ---------- Interrupts ---------- */
 
 void gba_request_interrupt(GbaMemory *mem, uint16_t flag) {
+    static int vblank_irq_trace = 0;
+    static uint64_t last_vblank_irq_cycle = 0;
+    if ((flag & GBA_INT_VBLANK) && mem->cpu && vblank_irq_trace < 20) {
+        uint64_t now = mem->cpu->total_cycles;
+        uint64_t delta = (last_vblank_irq_cycle == 0) ? 0 : (now - last_vblank_irq_cycle);
+        fprintf(stderr, "[VBL_IRQ] cycle=%llu delta=%llu IE=0x%04X IF=0x%04X IME=%d\n",
+            (unsigned long long)now, (unsigned long long)delta,
+            mem->ie, mem->ifl, mem->ime);
+        last_vblank_irq_cycle = now;
+        vblank_irq_trace++;
+    }
     mem->ifl |= flag;
+
+    /* NOTE: BIOS IF at 0x03007FF8 is updated by the BIOS IRQ stub
+     * (ARM code at 0x80), not here. The stub reads IE & IF, ORs the
+     * matched bits into [0x03FFFFF8], then calls the user handler.
+     * Doing it here prematurely would wake IntrWait before the IRQ
+     * handler has run. */
+
     if (mem->ime && (mem->ie & mem->ifl)) {
         if (mem->cpu) {
             arm7_request_irq(mem->cpu);

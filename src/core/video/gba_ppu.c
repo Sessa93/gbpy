@@ -14,6 +14,7 @@
 
 #include "gba_ppu.h"
 #include "../memory/gba_memory.h"
+#include <stdio.h>
 
 /* ---------- Helpers ---------- */
 
@@ -122,6 +123,18 @@ static void render_text_bg(GbaPPU *ppu, int bg, uint16_t line) {
     bool color256 = BGCNT_COLOR_MODE(bgcnt);
     uint8_t size = BGCNT_SIZE(bgcnt);
 
+    /* One-time trace for menu debug */
+    static int rtb_trace = 0;
+    static int rtb_menu_frames = 0;
+    uint16_t dispcnt_check = get_dispcnt(mem);
+    if (dispcnt_check == 0x3140 && line == 0 && bg == 0) rtb_menu_frames++;
+    if (rtb_trace < 3 && bg == 0 && line == 120 && dispcnt_check == 0x3140 && rtb_menu_frames > 5) {
+        rtb_trace++;
+        fprintf(stderr, "[RTB] bg=0 line=120 bgcnt=0x%04X tile_base=0x%X map_base=0x%X color256=%d size=%d mf=%d\n",
+            bgcnt, tile_base, map_base, color256, size, rtb_menu_frames);
+        fprintf(stderr, "[RTB] hofs=%d vofs=%d\n", hofs, vofs);
+    }
+
     uint16_t bg_w = text_bg_width[size];
     uint16_t bg_h = text_bg_height[size];
 
@@ -152,6 +165,20 @@ static void render_text_bg(GbaPPU *ppu, int bg, uint16_t line) {
 
         uint16_t fy = v_flip ? (7 - fine_y) : fine_y;
         uint16_t fx = h_flip ? (7 - fine_x) : fine_x;
+
+        /* Pixel trace for X=24 */
+        if (rtb_trace > 0 && rtb_trace <= 3 && x == 24 && bg == 0 && line == 120 && rtb_menu_frames > 5) {
+            rtb_trace = 2;
+            fprintf(stderr, "[RTB] X=24: map_addr=0x%05X map_entry=0x%04X tile_num=%d\n",
+                map_addr, map_entry, tile_num);
+            fprintf(stderr, "[RTB]   hflip=%d vflip=%d pal_bank=%d fine_y=%d fy=%d fx=%d\n",
+                h_flip, v_flip, pal_bank, fine_y, fy, fx);
+            uint32_t addr = tile_base + tile_num * 32 + fy * 4 + fx / 2;
+            uint8_t byte = mem->vram[addr & 0x17FFF];
+            uint8_t px_val = (fx & 1) ? (byte >> 4) : (byte & 0xF);
+            fprintf(stderr, "[RTB]   addr=0x%05X byte=0x%02X pixel=%d color256=%d\n",
+                addr, byte, px_val, color256);
+        }
 
         uint8_t pixel;
         if (color256) {
@@ -335,6 +362,7 @@ static void render_sprites(GbaPPU *ppu, uint16_t line) {
 
     memset(ppu->obj_pixel_valid, 0, sizeof(ppu->obj_pixel_valid));
     memset(ppu->obj_semi_trans, 0, sizeof(ppu->obj_semi_trans));
+    memset(ppu->obj_is_window, 0, sizeof(ppu->obj_is_window));
 
     /* Iterate all 128 OAM entries (lower index = higher priority) */
     for (int i = 0; i < 128; i++) {
@@ -436,10 +464,14 @@ static void render_sprites(GbaPPU *ppu, uint16_t line) {
                     color = palette_read(mem, 256 + palette_bank * 16 + pixel);
                 }
 
-                ppu->obj_line[screen_x] = color;
-                ppu->obj_prio[screen_x] = priority;
-                ppu->obj_pixel_valid[screen_x] = true;
-                ppu->obj_semi_trans[screen_x] = (obj_mode == 1);
+                if (obj_mode == 2) {
+                    ppu->obj_is_window[screen_x] = true;
+                } else {
+                    ppu->obj_line[screen_x] = color;
+                    ppu->obj_prio[screen_x] = priority;
+                    ppu->obj_pixel_valid[screen_x] = true;
+                    ppu->obj_semi_trans[screen_x] = (obj_mode == 1);
+                }
             }
         } else {
             /* Regular (non-affine) sprite */
@@ -491,16 +523,41 @@ static void render_sprites(GbaPPU *ppu, uint16_t line) {
                     color = palette_read(mem, 256 + palette_bank * 16 + pixel);
                 }
 
-                ppu->obj_line[screen_x] = color;
-                ppu->obj_prio[screen_x] = priority;
-                ppu->obj_pixel_valid[screen_x] = true;
-                ppu->obj_semi_trans[screen_x] = (obj_mode == 1);
+                if (obj_mode == 2) {
+                    ppu->obj_is_window[screen_x] = true;
+                } else {
+                    ppu->obj_line[screen_x] = color;
+                    ppu->obj_prio[screen_x] = priority;
+                    ppu->obj_pixel_valid[screen_x] = true;
+                    ppu->obj_semi_trans[screen_x] = (obj_mode == 1);
+                }
             }
         }
     }
 }
 
-/* ---------- Compose scanline with priority and blending ---------- */
+/* ---------- Window helpers ---------- */
+
+/* Check if pixel x is inside a horizontal window range */
+static GBPY_INLINE bool in_window_h(uint16_t winh, int x) {
+    uint8_t x1 = (winh >> 8) & 0xFF; /* left */
+    uint8_t x2 = winh & 0xFF;        /* right */
+    if (x1 <= x2)
+        return x >= x1 && x < x2;
+    else /* wraparound */
+        return x >= x1 || x < x2;
+}
+
+static GBPY_INLINE bool in_window_v(uint16_t winv, int y) {
+    uint8_t y1 = (winv >> 8) & 0xFF; /* top */
+    uint8_t y2 = winv & 0xFF;        /* bottom */
+    if (y1 <= y2)
+        return y >= y1 && y < y2;
+    else /* wraparound */
+        return y >= y1 || y < y2;
+}
+
+/* ---------- Compose scanline with priority, windowing and blending ---------- */
 
 static void compose_scanline(GbaPPU *ppu, uint16_t line) {
     GbaMemory *mem = ppu->mem;
@@ -508,6 +565,19 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
     uint16_t bldcnt = *(uint16_t *)&mem->io[0x050];
     uint16_t bldalpha = *(uint16_t *)&mem->io[0x052];
     uint16_t bldy = *(uint16_t *)&mem->io[0x054];
+
+    /* One-time per-pixel trace for menu debugging */
+    static int trace_done = 0;
+    static int menu_frames = 0;
+    if (dispcnt == 0x3140 && line == 0) menu_frames++;
+    if (trace_done < 3 && dispcnt == 0x3140 && line == 120 && menu_frames > 5) {
+        trace_done++;
+        fprintf(stderr, "[TRACE] compose_scanline line=120 dispcnt=0x%04X menu_frame=%d\n", dispcnt, menu_frames);
+        for (int tx = 16; tx <= 128; tx += 8) {
+            fprintf(stderr, "[TRACE]  X=%d: bg0_valid=%d bg0_color=0x%04X bg0_prio=%d\n",
+                tx, ppu->bg_pixel_valid[0][tx], ppu->bg_line[0][tx], ppu->bg_priority[0]);
+        }
+    }
 
     uint8_t blend_mode = (bldcnt >> 6) & 3;
     uint8_t first_targets = bldcnt & 0x3F;
@@ -522,7 +592,7 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
     uint16_t backdrop = palette_read(mem, 0);
     uint8_t *fb = &ppu->framebuffer[line * GBA_SCREEN_W * 4];
 
-    /* Check which BGs are enabled */
+    /* Check which BGs are enabled globally */
     bool bg_enabled[4] = {
         DISPCNT_BG0_EN(dispcnt) != 0,
         DISPCNT_BG1_EN(dispcnt) != 0,
@@ -531,8 +601,43 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
     };
     bool obj_enabled = DISPCNT_OBJ_EN(dispcnt) != 0;
 
+    /* Windowing setup */
+    bool win0_en = DISPCNT_WIN0_EN(dispcnt) != 0;
+    bool win1_en = DISPCNT_WIN1_EN(dispcnt) != 0;
+    bool objwin_en = DISPCNT_OBJWIN_EN(dispcnt) != 0;
+    bool any_window = win0_en || win1_en || objwin_en;
+
+    uint16_t win0h = *(uint16_t *)&mem->io[0x040];
+    uint16_t win0v = *(uint16_t *)&mem->io[0x044];
+    uint16_t win1h = *(uint16_t *)&mem->io[0x042];
+    uint16_t win1v = *(uint16_t *)&mem->io[0x046];
+    uint16_t winin = *(uint16_t *)&mem->io[0x048];
+    uint16_t winout = *(uint16_t *)&mem->io[0x04A];
+
+    /* Pre-check vertical ranges for win0/win1 */
+    bool win0_v = win0_en && in_window_v(win0v, line);
+    bool win1_v = win1_en && in_window_v(win1v, line);
+
     for (int x = 0; x < GBA_SCREEN_W; x++) {
-        /* Find top two layers by priority */
+        /* Determine per-pixel window flags (bits: 0-3=BG0-BG3, 4=OBJ, 5=Effects) */
+        uint8_t wflags = 0x3F; /* default: everything enabled */
+
+        if (any_window) {
+            if (win0_v && in_window_h(win0h, x)) {
+                wflags = winin & 0x3F;
+            } else if (win1_v && in_window_h(win1h, x)) {
+                wflags = (winin >> 8) & 0x3F;
+            } else if (objwin_en && obj_enabled && ppu->obj_pixel_valid[x]
+                       && ppu->obj_is_window[x]) {
+                wflags = (winout >> 8) & 0x3F;
+            } else {
+                wflags = winout & 0x3F;
+            }
+        }
+
+        bool effects_enabled = (wflags >> 5) & 1;
+
+        /* Find top two layers by priority, filtered by window */
         uint16_t top_color = backdrop;
         uint8_t top_layer = LAYER_BD;
         uint16_t second_color = backdrop;
@@ -543,6 +648,7 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
         /* Check BGs */
         for (int bg = 0; bg < 4; bg++) {
             if (!bg_enabled[bg] || !ppu->bg_pixel_valid[bg][x]) continue;
+            if (!(wflags & (1 << bg))) continue; /* window hides this BG */
             uint8_t p = ppu->bg_priority[bg];
             if (p < top_prio || (p == top_prio && bg < top_layer)) {
                 second_color = top_color;
@@ -559,7 +665,7 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
         }
 
         /* Check OBJ */
-        if (obj_enabled && ppu->obj_pixel_valid[x]) {
+        if (obj_enabled && ppu->obj_pixel_valid[x] && (wflags & (1 << 4))) {
             uint8_t p = ppu->obj_prio[x];
             if (p <= top_prio) {
                 second_color = top_color;
@@ -575,18 +681,20 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
             }
         }
 
-        /* Apply blending */
+        /* Apply blending (only if window allows effects) */
         uint16_t final_color = top_color;
         bool do_blend = false;
 
-        /* Semi-transparent OBJ forces alpha blending */
-        if (top_layer == LAYER_OBJ && ppu->obj_semi_trans[x]) {
-            if (second_targets & (1 << second_layer)) {
+        if (effects_enabled || (top_layer == LAYER_OBJ && ppu->obj_semi_trans[x])) {
+            /* Semi-transparent OBJ forces alpha blending (always, ignoring window) */
+            if (top_layer == LAYER_OBJ && ppu->obj_semi_trans[x]) {
+                if (second_targets & (1 << second_layer)) {
+                    do_blend = true;
+                }
+            } else if (blend_mode == BLEND_ALPHA && (first_targets & (1 << top_layer))
+                       && (second_targets & (1 << second_layer))) {
                 do_blend = true;
             }
-        } else if (blend_mode == BLEND_ALPHA && (first_targets & (1 << top_layer))
-                   && (second_targets & (1 << second_layer))) {
-            do_blend = true;
         }
 
         if (do_blend) {
@@ -606,7 +714,8 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
             if (b > 31) b = 31;
 
             final_color = r | (g << 5) | (b << 10);
-        } else if (blend_mode == BLEND_BRIGHTEN && (first_targets & (1 << top_layer))) {
+        } else if (effects_enabled && blend_mode == BLEND_BRIGHTEN
+                   && (first_targets & (1 << top_layer))) {
             uint8_t r = (top_color & 0x1F);
             uint8_t g = ((top_color >> 5) & 0x1F);
             uint8_t b = ((top_color >> 10) & 0x1F);
@@ -614,7 +723,8 @@ static void compose_scanline(GbaPPU *ppu, uint16_t line) {
             g += (31 - g) * evy / 16;
             b += (31 - b) * evy / 16;
             final_color = r | (g << 5) | (b << 10);
-        } else if (blend_mode == BLEND_DARKEN && (first_targets & (1 << top_layer))) {
+        } else if (effects_enabled && blend_mode == BLEND_DARKEN
+                   && (first_targets & (1 << top_layer))) {
             uint8_t r = (top_color & 0x1F);
             uint8_t g = ((top_color >> 5) & 0x1F);
             uint8_t b = ((top_color >> 10) & 0x1F);
@@ -693,9 +803,25 @@ void gba_ppu_step(GbaPPU *ppu, uint32_t cycles) {
     while (ppu->cycle >= GBA_LINE_CYCLES) {
         ppu->cycle -= GBA_LINE_CYCLES;
 
+        /* Clear HBlank at start of new line (HDraw period) */
+        {
+            uint16_t s = get_dispstat(mem);
+            set_dispstat(mem, s & ~DISPSTAT_HBLANK);
+        }
+
         /* Render visible line */
         if (ppu->line < GBA_SCREEN_H) {
             render_scanline(ppu);
+        }
+
+        /* HBlank fires after HDraw, BEFORE incrementing VCOUNT */
+        if (ppu->line < GBA_SCREEN_H) {
+            uint16_t s = get_dispstat(mem);
+            set_dispstat(mem, s | DISPSTAT_HBLANK);
+            if (s & DISPSTAT_HBLANK_IRQ) {
+                gba_request_interrupt(mem, GBA_INT_HBLANK);
+            }
+            gba_dma_trigger(mem, DMA_TIMING_HBLANK);
         }
 
         ppu->line++;
@@ -750,16 +876,6 @@ void gba_ppu_step(GbaPPU *ppu, uint32_t cycles) {
             }
         } else {
             set_dispstat(mem, dispstat & ~DISPSTAT_VCOUNTER);
-        }
-
-        /* HBlank occurs during visible lines */
-        if (ppu->line < GBA_SCREEN_H) {
-            uint16_t s = get_dispstat(mem);
-            set_dispstat(mem, s | DISPSTAT_HBLANK);
-            if (s & DISPSTAT_HBLANK_IRQ) {
-                gba_request_interrupt(mem, GBA_INT_HBLANK);
-            }
-            gba_dma_trigger(mem, DMA_TIMING_HBLANK);
         }
     }
 }

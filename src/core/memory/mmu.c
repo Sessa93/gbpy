@@ -24,6 +24,7 @@
 #include "gb_ppu.h"
 #include "input.h"
 #include "../audio/apu.h"
+#include "../timer.h"
 
 /*
  * I/O Register Addresses (Section 2.13.1)
@@ -224,22 +225,76 @@ uint8_t mmu_read(void *ctx, uint16_t addr) {
                 if (mmu->input) {
                     return input_read(mmu->input);
                 }
+                return mmu->io[reg] | 0xC0;
+
+            case IO_SC:
+                /* Bits 1-6 always read as 1 on DMG */
+                return mmu->io[reg] | 0x7E;
+
+            case IO_DIV:
+            case IO_TIMA:
+            case IO_TMA:
+                /* Timer registers: delegate to GbTimer */
+                if (mmu->timer) {
+                    return timer_read(mmu->timer, addr);
+                }
                 return mmu->io[reg];
+
+            case IO_TAC:
+                /* Timer register with upper bits always 1 */
+                if (mmu->timer) {
+                    return timer_read(mmu->timer, addr) | 0xF8;
+                }
+                return mmu->io[reg] | 0xF8;
+
+            case IO_IF:
+                /* Upper 3 bits of IF always read as 1 */
+                return mmu->io[reg] | 0xE0;
+
+            case IO_STAT:
+                /* Bit 7 of STAT always reads as 1 */
+                return mmu->io[reg] | 0x80;
 
             case IO_BCPS:
             case IO_BCPD:
             case IO_OCPS:
             case IO_OCPD:
-                /* GBC palette registers: delegate to PPU */
+                /* GBC palette registers: delegate to PPU on GBC, 0xFF on DMG */
                 if (mmu->mode == GBPY_MODE_GBC && mmu->ppu) {
                     return gb_ppu_read_palette(mmu->ppu, addr);
                 }
-                return mmu->io[reg];
+                return 0xFF;
+
+            case IO_KEY1:
+            case IO_VBK:
+            case IO_HDMA1:
+            case IO_HDMA2:
+            case IO_HDMA3:
+            case IO_HDMA4:
+            case IO_HDMA5:
+            case IO_SVBK:
+                /* GBC-only registers: return value on GBC, 0xFF on DMG */
+                if (mmu->mode == GBPY_MODE_GBC) {
+                    return mmu->io[reg];
+                }
+                return 0xFF;
 
             default:
                 /* Sound registers: NR10-NR52 (0x10-0x26) and Wave RAM (0x30-0x3F) */
                 if (mmu->apu && ((reg >= 0x10 && reg <= 0x26) || (reg >= 0x30 && reg <= 0x3F))) {
                     return apu_read(mmu->apu, addr);
+                }
+                /* Unused IO ports return 0xFF on DMG */
+                if (reg == 0x03 || (reg >= 0x08 && reg <= 0x0E) ||
+                    reg == 0x15 || reg == 0x1F ||
+                    (reg >= 0x27 && reg <= 0x2F) ||
+                    reg == 0x4C || reg == 0x4E || reg == 0x50 ||
+                    (reg >= 0x56 && reg <= 0x67) ||
+                    (reg >= 0x6C && reg <= 0x6F) ||
+                    (reg >= 0x71 && reg <= 0x7F)) {
+                    if (mmu->mode != GBPY_MODE_GBC) {
+                        return 0xFF;
+                    }
                 }
                 return mmu->io[reg];
         }
@@ -364,9 +419,41 @@ void mmu_write(void *ctx, uint16_t addr, uint8_t val) {
                 break;
 
             case IO_DIV:
-                /* Writing any value to DIV resets it to 0 (Section 2.10.1) */
-                mmu->io[reg] = 0;
+            case IO_TIMA:
+            case IO_TMA:
+            case IO_TAC:
+                /* Timer registers: delegate to GbTimer */
+                if (mmu->timer) {
+                    timer_write(mmu->timer, addr, val);
+                }
                 break;
+
+            case IO_IF:
+                /* Only lower 5 bits of IF are writable */
+                mmu->io[reg] = val & 0x1F;
+                break;
+
+            case IO_STAT: {
+                /* Only bits 3-6 are writable (interrupt enable flags).
+                 * Bits 0-2 (mode, coincidence) are read-only. Bit 7 unused. */
+                uint8_t readonly = mmu->io[reg] & 0x07;  /* preserve mode + coincidence */
+                mmu->io[reg] = (val & 0x78) | readonly;  /* write bits 3-6 only */
+
+                /* DMG STAT write bug: writing to STAT can cause a spurious STAT
+                 * interrupt. Only fires on the rising edge (when the STAT IRQ
+                 * line is currently LOW, i.e., no condition is already active). */
+                if (mmu->mode != GBPY_MODE_GBC && mmu->ppu) {
+                    uint8_t lcdc = mmu->io[0x40]; /* IO_LCDC */
+                    if (lcdc & 0x80) {             /* LCD enabled */
+                        GbPPU *ppu = (GbPPU *)mmu->ppu;
+                        if (!ppu->stat_irq_line) {
+                            /* Line was low, glitch pulls it high → rising edge */
+                            mmu->io[IO_IF] |= 0x02; /* INT_LCD */
+                        }
+                    }
+                }
+                break;
+            }
 
             case IO_BCPS:
             case IO_BCPD:
@@ -380,6 +467,24 @@ void mmu_write(void *ctx, uint16_t addr, uint8_t val) {
                 break;
 
             default:
+                /* Serial transfer control: capture output byte and complete transfer */
+                if (reg == IO_SC && (val & 0x80) && (val & 0x01)) {
+                    /* Internal clock selected — complete transfer immediately */
+                    if (mmu->serial_pos < sizeof(mmu->serial_buf) - 1) {
+                        mmu->serial_buf[mmu->serial_pos++] = (char)mmu->io[IO_SB];
+                        mmu->serial_buf[mmu->serial_pos] = '\0';
+                    }
+                    mmu->io[IO_SB] = 0xFF; /* No link cable: receive 0xFF */
+                    val &= 0x7F;           /* Clear transfer flag (bit 7) */
+                    /* Request serial interrupt */
+                    mmu->io[IO_IF] |= 0x08;
+                } else if (reg == IO_SC && (val & 0x80)) {
+                    /* External clock — capture but don't auto-complete */
+                    if (mmu->serial_pos < sizeof(mmu->serial_buf) - 1) {
+                        mmu->serial_buf[mmu->serial_pos++] = (char)mmu->io[IO_SB];
+                        mmu->serial_buf[mmu->serial_pos] = '\0';
+                    }
+                }
                 /* Sound registers: NR10-NR52 (0x10-0x26) and Wave RAM (0x30-0x3F) */
                 if (mmu->apu && ((reg >= 0x10 && reg <= 0x26) || (reg >= 0x30 && reg <= 0x3F))) {
                     apu_write(mmu->apu, addr, val);

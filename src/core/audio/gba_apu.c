@@ -194,6 +194,19 @@ static void legacy_step_sample(GbaLegacyAPU *leg, int16_t *left, int16_t *right,
 
 /* ---------- Timer overflow -> DMA sound ---------- */
 
+/* Trigger only DMA1/2 for sound FIFO (SPECIAL timing on DMA1/2 = sound) */
+static void dma_trigger_sound(GbaMemory *mem) {
+    for (int ch = 1; ch <= 2; ch++) {
+        GbaDMA *dma = &mem->dma[ch];
+        if (!(dma->control & (1 << 15))) continue;
+        uint8_t dma_timing = (dma->control >> 12) & 3;
+        if (dma_timing == DMA_TIMING_SPECIAL) {
+            dma->active = true;
+            /* dma_run_channel will be called by gba_dma_step */
+        }
+    }
+}
+
 void gba_apu_timer_overflow(GbaAPU *apu, int timer_id) {
     GbaMemory *mem = apu->mem;
     if (!mem) return;
@@ -203,8 +216,8 @@ void gba_apu_timer_overflow(GbaAPU *apu, int timer_id) {
     if (SOUNDCNT_H_DMA_A_TIMER(soundcnt_h) == timer_id) {
         fifo_read(&apu->fifo_a);
         if (apu->fifo_a.count <= 16) {
-            /* Request DMA refill for FIFO A (DMA1 or DMA2) */
-            gba_dma_trigger(mem, DMA_TIMING_SPECIAL);
+            /* Request DMA refill for FIFO A (DMA1 or DMA2 only) */
+            dma_trigger_sound(mem);
         }
     }
 
@@ -212,7 +225,7 @@ void gba_apu_timer_overflow(GbaAPU *apu, int timer_id) {
     if (SOUNDCNT_H_DMA_B_TIMER(soundcnt_h) == timer_id) {
         fifo_read(&apu->fifo_b);
         if (apu->fifo_b.count <= 16) {
-            gba_dma_trigger(mem, DMA_TIMING_SPECIAL);
+            dma_trigger_sound(mem);
         }
     }
 }

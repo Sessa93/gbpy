@@ -13,6 +13,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "emulator.h"
+#include "memory/mmu.h"
 
 /* ---------- EmulatorObject ---------- */
 
@@ -236,6 +237,53 @@ static PyObject *Emulator_get_frame_ready(EmulatorObject *self, void *closure) {
     return PyBool_FromLong(self->emu.frame_ready);
 }
 
+/* get_serial_output() -> str  (GB/GBC serial port capture) */
+static PyObject *Emulator_get_serial_output(EmulatorObject *self, PyObject *Py_UNUSED(args)) {
+    if (self->emu.mode == GBPY_MODE_GB || self->emu.mode == GBPY_MODE_GBC) {
+        return PyUnicode_FromStringAndSize(self->emu.mmu.serial_buf,
+                                           self->emu.mmu.serial_pos);
+    }
+    return PyUnicode_FromString("");
+}
+
+/* get_cpu_registers() -> dict  (GB/GBC SM83 registers) */
+static PyObject *Emulator_get_cpu_registers(EmulatorObject *self, PyObject *Py_UNUSED(args)) {
+    PyObject *d = PyDict_New();
+    if (!d) return NULL;
+    if (self->emu.mode == GBPY_MODE_GB || self->emu.mode == GBPY_MODE_GBC) {
+        SM83 *cpu = &self->emu.cpu_sm83;
+        PyDict_SetItemString(d, "a",  PyLong_FromLong(cpu->a));
+        PyDict_SetItemString(d, "f",  PyLong_FromLong(cpu->f));
+        PyDict_SetItemString(d, "b",  PyLong_FromLong(cpu->b));
+        PyDict_SetItemString(d, "c",  PyLong_FromLong(cpu->c));
+        PyDict_SetItemString(d, "d",  PyLong_FromLong(cpu->d));
+        PyDict_SetItemString(d, "e",  PyLong_FromLong(cpu->e));
+        PyDict_SetItemString(d, "h",  PyLong_FromLong(cpu->h));
+        PyDict_SetItemString(d, "l",  PyLong_FromLong(cpu->l));
+        PyDict_SetItemString(d, "sp", PyLong_FromLong(cpu->sp));
+        PyDict_SetItemString(d, "pc", PyLong_FromLong(cpu->pc));
+        PyDict_SetItemString(d, "halted", PyBool_FromLong(cpu->halted));
+    }
+    return d;
+}
+
+/* read_memory(addr: int) -> int  (read a byte from GB/GBC address space) */
+static PyObject *Emulator_read_memory(EmulatorObject *self, PyObject *args) {
+    unsigned int addr;
+    if (!PyArg_ParseTuple(args, "I", &addr))
+        return NULL;
+    if (self->emu.mode == GBPY_MODE_GB || self->emu.mode == GBPY_MODE_GBC) {
+        if (addr > 0xFFFF) {
+            PyErr_SetString(PyExc_ValueError, "Address out of range");
+            return NULL;
+        }
+        uint8_t val = mmu_read(&self->emu.mmu, (uint16_t)addr);
+        return PyLong_FromLong(val);
+    }
+    PyErr_SetString(PyExc_RuntimeError, "read_memory only for GB/GBC");
+    return NULL;
+}
+
 /* ---------- Method table ---------- */
 
 static PyMethodDef Emulator_methods[] = {
@@ -252,6 +300,9 @@ static PyMethodDef Emulator_methods[] = {
     {"load_state",    (PyCFunction)Emulator_load_state,    METH_VARARGS, "Load state from file"},
     {"save_ram",      (PyCFunction)Emulator_save_ram,      METH_NOARGS,  "Save battery RAM"},
     {"load_ram",      (PyCFunction)Emulator_load_ram,      METH_NOARGS,  "Load battery RAM"},
+    {"get_serial_output", (PyCFunction)Emulator_get_serial_output, METH_NOARGS, "Get serial output string"},
+    {"get_cpu_registers", (PyCFunction)Emulator_get_cpu_registers, METH_NOARGS, "Get CPU register dict"},
+    {"read_memory",   (PyCFunction)Emulator_read_memory,   METH_VARARGS, "Read a byte from memory"},
     {NULL}
 };
 

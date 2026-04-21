@@ -8,6 +8,10 @@
  */
 
 #include "arm7tdmi.h"
+#include "../memory/gba_memory.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ---------- Helpers ---------- */
 
@@ -168,9 +172,10 @@ void arm7_check_interrupts(ARM7TDMI *cpu) {
     if (cpu->fiq_pending && !(cpu->cpsr & ARM_FLAG_F)) {
         cpu->fiq_pending = false;
         cpu->halted = false;
-        uint32_t return_addr = PC - (IS_THUMB() ? 2 : 4) + 4;
+        uint32_t return_addr = PC + 4;
+        uint32_t old_cpsr = cpu->cpsr;
         arm7_switch_mode(cpu, ARM_MODE_FIQ);
-        cpu->spsr = cpu->cpsr;
+        cpu->spsr = old_cpsr;
         LR = return_addr;
         cpu->cpsr |= ARM_FLAG_I | ARM_FLAG_F;
         cpu->cpsr &= ~ARM_FLAG_T;
@@ -182,9 +187,10 @@ void arm7_check_interrupts(ARM7TDMI *cpu) {
     if (cpu->irq_pending && !(cpu->cpsr & ARM_FLAG_I)) {
         cpu->irq_pending = false;
         cpu->halted = false;
-        uint32_t return_addr = PC - (IS_THUMB() ? 2 : 4) + 4;
+        uint32_t return_addr = PC + 4;
+        uint32_t old_cpsr = cpu->cpsr;
         arm7_switch_mode(cpu, ARM_MODE_IRQ);
-        cpu->spsr = cpu->cpsr;
+        cpu->spsr = old_cpsr;
         LR = return_addr;
         cpu->cpsr |= ARM_FLAG_I;
         cpu->cpsr &= ~ARM_FLAG_T;
@@ -333,7 +339,11 @@ static uint32_t arm_data_processing(ARM7TDMI *cpu, uint32_t instr) {
         /* Immediate: 8-bit value rotated by 2*rot */
         uint8_t imm = instr & 0xFF;
         uint8_t rot = ((instr >> 8) & 0xF) * 2;
-        op2 = (imm >> rot) | (imm << (32 - rot));
+        if (rot == 0) {
+            op2 = imm;
+        } else {
+            op2 = (imm >> rot) | (imm << (32 - rot));
+        }
         if (rot > 0) carry_out = (op2 >> 31) & 1;
     } else {
         /* Register */
@@ -424,13 +434,20 @@ static uint32_t arm_data_processing(ARM7TDMI *cpu, uint32_t instr) {
     }
 
     if (write_result) {
-        cpu->r[rd] = result;
         if (rd == 15) {
+            uint32_t new_pc = result;
             if (S) {
-                /* MOVS PC, ... restores CPSR from SPSR */
-                cpu->cpsr = cpu->spsr;
+                /* SUBS PC, ... / MOVS PC, ... restores CPSR from SPSR */
+                uint32_t new_cpsr = cpu->spsr;
+                arm7_switch_mode(cpu, new_cpsr & ARM_MODE_MASK);
+                cpu->cpsr = new_cpsr;
             }
+
+            new_pc &= IS_THUMB() ? ~1u : ~3u;
+            PC = new_pc;
             flush_pipeline(cpu);
+        } else {
+            cpu->r[rd] = result;
         }
     }
 
@@ -527,7 +544,10 @@ static uint32_t arm_single_transfer(ARM7TDMI *cpu, uint32_t instr) {
             }
             cpu->r[rd] = val;
         }
-        if (rd == 15) flush_pipeline(cpu);
+        if (rd == 15) {
+            PC &= ~3u;
+            flush_pipeline(cpu);
+        }
     } else {
         uint32_t val = cpu->r[rd];
         if (rd == 15) val += 4; /* Pipeline */
@@ -584,7 +604,10 @@ static uint32_t arm_halfword_transfer(ARM7TDMI *cpu, uint32_t instr) {
                 cpu->r[rd] = (uint32_t)(int32_t)(int16_t)READ16(addr);
                 break;
         }
-        if (rd == 15) flush_pipeline(cpu);
+        if (rd == 15) {
+            PC &= ~3u;
+            flush_pipeline(cpu);
+        }
     } else {
         if (sh == 1) { /* STRH */
             WRITE16(addr, (uint16_t)cpu->r[rd]);
@@ -605,7 +628,7 @@ static uint32_t arm_block_transfer(ARM7TDMI *cpu, uint32_t instr) {
     uint8_t rn = (instr >> 16) & 0xF;
     bool P = (instr >> 24) & 1;
     bool U = (instr >> 23) & 1;
-    bool S = (instr >> 22) & 1; /* User bank transfer */
+    bool S = (instr >> 22) & 1; /* User bank / CPSR restore */
     bool W = (instr >> 21) & 1;
     bool L = (instr >> 20) & 1;
     uint16_t rlist = instr & 0xFFFF;
@@ -615,7 +638,7 @@ static uint32_t arm_block_transfer(ARM7TDMI *cpu, uint32_t instr) {
     for (int i = 0; i < 16; i++) {
         if (rlist & (1 << i)) count++;
     }
-    if (count == 0) count = 16; /* Empty rlist: transfer R15 and add 0x40 */
+    if (count == 0) count = 16; /* Empty rlist: add 0x40 */
 
     uint32_t start_addr;
     if (U) {
@@ -624,23 +647,66 @@ static uint32_t arm_block_transfer(ARM7TDMI *cpu, uint32_t instr) {
         start_addr = P ? base - count * 4 : base - count * 4 + 4;
     }
 
-    (void)S; /* User bank transfer - simplified */
+    /* Determine if we need user-bank access (S=1 and NOT LDM with R15) */
+    bool user_bank = S && !(L && (rlist & (1 << 15)));
+    uint8_t cur_mode = current_mode(cpu);
+    bool is_priv = cur_mode != ARM_MODE_USR && cur_mode != ARM_MODE_SYS;
 
     uint32_t addr = start_addr;
     for (int i = 0; i < 16; i++) {
         if (!(rlist & (1 << i))) continue;
-        if (L) {
-            cpu->r[i] = READ32(addr);
-            if (i == 15) flush_pipeline(cpu);
+
+        if (user_bank && is_priv && i >= 8 && i <= 14) {
+            /* Access user-mode banked registers */
+            if (L) {
+                uint32_t val = READ32(addr);
+                if (i >= 8 && i <= 12) {
+                    if (cur_mode == ARM_MODE_FIQ)
+                        cpu->usr_r8_r12[i - 8] = val;
+                    else
+                        cpu->r[i] = val;
+                } else if (i == 13) {
+                    if (is_priv) cpu->usr_r13 = val; else cpu->r[13] = val;
+                } else if (i == 14) {
+                    if (is_priv) cpu->usr_r14 = val; else cpu->r[14] = val;
+                }
+            } else {
+                uint32_t val;
+                if (i >= 8 && i <= 12) {
+                    val = (cur_mode == ARM_MODE_FIQ) ? cpu->usr_r8_r12[i - 8] : cpu->r[i];
+                } else if (i == 13) {
+                    val = is_priv ? cpu->usr_r13 : cpu->r[13];
+                } else { /* i == 14 */
+                    val = is_priv ? cpu->usr_r14 : cpu->r[14];
+                }
+                WRITE32(addr, val);
+            }
         } else {
-            uint32_t val = cpu->r[i];
-            if (i == 15) val += 4;
-            WRITE32(addr, val);
+            /* Normal register access */
+            if (L) {
+                cpu->r[i] = READ32(addr);
+                if (i == 15) {
+                    /* S=1 with R15 in LDM: restore CPSR from SPSR */
+                    if (S && is_priv) {
+                        uint32_t new_cpsr = cpu->spsr;
+                        arm7_switch_mode(cpu, new_cpsr & ARM_MODE_MASK);
+                        cpu->cpsr = new_cpsr;
+                    }
+                    PC &= IS_THUMB() ? ~1u : ~3u;
+                    flush_pipeline(cpu);
+                }
+            } else {
+                uint32_t val = cpu->r[i];
+                if (i == 15) val += 4;
+                WRITE32(addr, val);
+            }
         }
         addr += 4;
     }
 
-    if (W) {
+    /* Writeback (not performed when S=1 user-bank and W=1 in privileged mode,
+       but many emulators just do it regardless — the ARM ARM says "unpredictable") */
+    if (W && !user_bank) {
         cpu->r[rn] = U ? base + count * 4 : base - count * 4;
     }
 
@@ -653,10 +719,10 @@ static uint32_t arm_branch(ARM7TDMI *cpu, uint32_t instr) {
     int32_t offset = (int32_t)(instr << 8) >> 6; /* Sign-extend 24-bit, *4 */
 
     if (L) {
-        LR = PC - 4; /* Save return address */
+        LR = PC; /* Return address = next instruction (PC is already inst+4) */
     }
 
-    PC += offset;
+    PC += offset + 4; /* +4 for pipeline: real PC = inst+8, ours = inst+4 */
     flush_pipeline(cpu);
     return 3;
 }
@@ -677,17 +743,495 @@ static uint32_t arm_branch_exchange(ARM7TDMI *cpu, uint32_t instr) {
     return 3;
 }
 
+/* ---------- HLE BIOS SWI ---------- */
+
+/*
+ * High-Level Emulation of GBA BIOS software interrupts.
+ * Instead of jumping to a real BIOS ROM at 0x08, we handle common
+ * SWI functions directly in C.  The SWI number is extracted by the
+ * caller: bits [23:16] for ARM, bits [7:0] for Thumb.
+ *
+ * After execution, return to the address in LR_svc (already saved by
+ * the ARM/Thumb SWI entry code) and restore CPSR from SPSR_svc.
+ */
+
+static void swi_return(ARM7TDMI *cpu) {
+    /* Restore CPSR from SPSR, return to LR */
+    uint32_t ret = LR;
+    uint32_t saved_cpsr = cpu->spsr;
+    arm7_switch_mode(cpu, saved_cpsr & ARM_MODE_MASK);
+    cpu->cpsr = saved_cpsr;
+    PC = ret;
+    flush_pipeline(cpu);
+}
+
+/* Trace state for post-VBL execution logging */
+static int vbl_swi_done = 0;      /* incremented in hle_swi after SWI 0x05 */
+static int post_vbl_traced = 0;   /* instructions traced after 3rd VBL wake */
+
+static void hle_swi(ARM7TDMI *cpu, uint8_t num) {
+    static int swi_trace = 0;
+    static uint64_t last_vblank_cycles = 0;
+    bool do_return = true;
+    if (swi_trace < 30) {
+        fprintf(stderr, "[SWI] num=0x%02X R0=0x%08X R1=0x%08X R2=0x%08X PC=0x%08X LR=0x%08X\n",
+            num, cpu->r[0], cpu->r[1], cpu->r[2], PC, LR);
+        swi_trace++;
+    }
+    if (num == 0x05 && last_vblank_cycles > 0) {
+        static int vbl_count = 0;
+        uint64_t delta = cpu->total_cycles - last_vblank_cycles;
+        if (vbl_count < 10) {
+            fprintf(stderr, "[VBL] cycles_between=%llu\n", (unsigned long long)delta);
+            vbl_count++;
+        }
+    }
+    if (num == 0x05) last_vblank_cycles = cpu->total_cycles;
+    switch (num) {
+        case 0x00: { /* SoftReset */
+            /* Clear 0x03007E00-0x03007FFF, reset stack pointers, jump to ROM */
+            for (uint32_t a = 0x03007E00; a < 0x03008000; a++)
+                WRITE8(a, 0);
+            cpu->svc_r13 = 0x03007FE0;
+            cpu->irq_r13 = 0x03007FA0;
+            arm7_switch_mode(cpu, ARM_MODE_SYS);
+            cpu->r[13] = 0x03007F00;
+            cpu->cpsr = ARM_MODE_SYS;
+            PC = 0x08000000;
+            flush_pipeline(cpu);
+            return; /* Don't do normal swi_return */
+        }
+
+        case 0x01: { /* RegisterRamReset (flags in R0) */
+            uint8_t flags = cpu->r[0] & 0xFF;
+            GbaMemory *rst_mem = (GbaMemory *)cpu->mem_ctx;
+            if (flags & 0x01) memset(rst_mem->ewram, 0, sizeof(rst_mem->ewram));
+            if (flags & 0x02) memset(rst_mem->iwram, 0, 0x7E00); /* Keep last 0x200 for IRQ stack */
+            if (flags & 0x04) memset(rst_mem->palette, 0, sizeof(rst_mem->palette));
+            if (flags & 0x08) memset(rst_mem->vram, 0, sizeof(rst_mem->vram));
+            if (flags & 0x10) memset(rst_mem->oam, 0, sizeof(rst_mem->oam));
+            if (flags & 0x20) { /* Reset SIO: clear 0x04000120-0x0400015A */ }
+            if (flags & 0x40) {
+                /* Reset Sound registers */
+                for (uint32_t off = 0x060; off < 0x0A8; off += 2)
+                    *(uint16_t *)&rst_mem->io[off] = 0;
+            }
+            if (flags & 0x80) {
+                /* Reset other IO registers */
+                for (uint32_t off = 0; off < 0x060; off += 2)
+                    *(uint16_t *)&rst_mem->io[off] = 0;
+            }
+            break;
+        }
+
+        case 0x02: /* Halt */
+            cpu->halted = true;
+            break;
+
+        case 0x03: /* Stop */
+            cpu->halted = true;
+            break;
+
+        case 0x04: { /* IntrWait (R0=discard_old, R1=flags) */
+            uint16_t wait_flags = cpu->r[1] & 0xFFFF;
+            if (cpu->r[0]) {
+                /* Discard old: clear requested flags in BIOS IF (0x03007FF8) */
+                uint16_t bios_if = READ16(0x03007FF8);
+                bios_if &= ~wait_flags;
+                WRITE16(0x03007FF8, bios_if);
+            }
+
+            /* Force IME=1 as per GBATEK */
+            WRITE16(0x04000208, 1);
+
+            /* BIOS blocks inside SWI until requested IRQ flags are latched. */
+            uint16_t bios_if = READ16(0x03007FF8);
+            if ((bios_if & wait_flags) == 0) {
+                cpu->intrwait_active = true;
+                cpu->intrwait_flags = wait_flags;
+                cpu->cpsr &= ~ARM_FLAG_I;
+                cpu->halted = true;
+                do_return = false;
+            }
+            break;
+        }
+
+        case 0x05: { /* VBlankIntrWait — equivalent to IntrWait(1, 1) */
+            uint16_t bios_if = READ16(0x03007FF8);
+            bios_if &= ~1u;
+            WRITE16(0x03007FF8, bios_if);
+
+            /* Force IME=1 as per GBATEK */
+            WRITE16(0x04000208, 1);
+
+            cpu->intrwait_active = true;
+            cpu->intrwait_flags = 1;
+            cpu->cpsr &= ~ARM_FLAG_I;
+            cpu->halted = true;
+            do_return = false;
+            vbl_swi_done++;
+            break;
+        }
+
+        case 0x06: { /* Div: R0=num, R1=den -> R0=quo, R1=rem, R3=abs(quo) */
+            int32_t num = (int32_t)cpu->r[0];
+            int32_t den = (int32_t)cpu->r[1];
+            if (den == 0) { break; }
+            cpu->r[0] = (uint32_t)(num / den);
+            cpu->r[1] = (uint32_t)(num % den);
+            cpu->r[3] = (uint32_t)(num / den < 0 ? -(num / den) : num / den);
+            break;
+        }
+
+        case 0x07: { /* DivArm: R0=den, R1=num (swapped args) */
+            int32_t num = (int32_t)cpu->r[1];
+            int32_t den = (int32_t)cpu->r[0];
+            if (den == 0) { break; }
+            cpu->r[0] = (uint32_t)(num / den);
+            cpu->r[1] = (uint32_t)(num % den);
+            cpu->r[3] = (uint32_t)(num / den < 0 ? -(num / den) : num / den);
+            break;
+        }
+
+        case 0x08: { /* Sqrt: R0=val -> R0=sqrt(val) */
+            uint32_t val = cpu->r[0];
+            uint32_t result = 0;
+            uint32_t bit = 1u << 30;
+            while (bit > val) bit >>= 2;
+            while (bit != 0) {
+                if (val >= result + bit) {
+                    val -= result + bit;
+                    result = (result >> 1) + bit;
+                } else {
+                    result >>= 1;
+                }
+                bit >>= 2;
+            }
+            cpu->r[0] = result;
+            break;
+        }
+
+        case 0x09: { /* ArcTan: R0=tan (s16.14) -> R0=angle (0..pi/2 as u16) */
+            /* Simplified: use floating point approximation */
+            int16_t t = (int16_t)(cpu->r[0] & 0xFFFF);
+            double tan_val = t / 16384.0;
+            double angle = atan(tan_val);
+            int16_t result = (int16_t)(angle * (32768.0 / 3.14159265358979));
+            cpu->r[0] = (uint32_t)(uint16_t)result;
+            break;
+        }
+
+        case 0x0A: { /* ArcTan2: R0=x, R1=y -> R0=angle (0..2*pi as u16) */
+            int16_t x = (int16_t)(cpu->r[0] & 0xFFFF);
+            int16_t y = (int16_t)(cpu->r[1] & 0xFFFF);
+            double angle = atan2((double)y, (double)x);
+            if (angle < 0) angle += 2.0 * 3.14159265358979;
+            uint16_t result = (uint16_t)(angle * (32768.0 / 3.14159265358979));
+            cpu->r[0] = result;
+            break;
+        }
+
+        case 0x0B: { /* CpuSet: R0=src, R1=dst, R2=len_mode */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t ctrl = cpu->r[2];
+            uint32_t count = ctrl & 0x1FFFFF;
+            bool fixed = (ctrl >> 24) & 1;
+            bool word = (ctrl >> 26) & 1;
+
+            if (word) {
+                src &= ~3u; dst &= ~3u;
+                uint32_t fill = READ32(src);
+                for (uint32_t i = 0; i < count; i++) {
+                    WRITE32(dst, fixed ? fill : READ32(src));
+                    dst += 4;
+                    if (!fixed) src += 4;
+                }
+            } else {
+                src &= ~1u; dst &= ~1u;
+                uint16_t fill = READ16(src);
+                for (uint32_t i = 0; i < count; i++) {
+                    WRITE16(dst, fixed ? fill : READ16(src));
+                    dst += 2;
+                    if (!fixed) src += 2;
+                }
+            }
+            break;
+        }
+
+        case 0x0C: { /* CpuFastSet: R0=src, R1=dst, R2=len_mode (words, 32-byte aligned) */
+            uint32_t src = cpu->r[0] & ~3u;
+            uint32_t dst = cpu->r[1] & ~3u;
+            uint32_t ctrl = cpu->r[2];
+            uint32_t count = ctrl & 0x1FFFFF;
+            bool fixed = (ctrl >> 24) & 1;
+
+            /* Round up to multiple of 8 words */
+            count = (count + 7) & ~7u;
+            uint32_t fill = READ32(src);
+            for (uint32_t i = 0; i < count; i++) {
+                WRITE32(dst, fixed ? fill : READ32(src));
+                dst += 4;
+                if (!fixed) src += 4;
+            }
+            break;
+        }
+
+        case 0x0E: { /* BgAffineSet */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t count = cpu->r[2];
+
+            for (uint32_t i = 0; i < count; i++) {
+                int32_t cx = (int32_t)READ32(src);      src += 4;
+                int32_t cy = (int32_t)READ32(src);      src += 4;
+                int16_t dx = (int16_t)READ16(src);      src += 2;
+                int16_t dy = (int16_t)READ16(src);      src += 2;
+                int16_t sx = (int16_t)READ16(src);      src += 2;
+                int16_t sy = (int16_t)READ16(src);      src += 2;
+                uint16_t angle = READ16(src);            src += 2;
+                src += 2; /* padding */
+
+                double a = (double)angle / 65536.0 * 2.0 * 3.14159265358979;
+                double cos_a = cos(a), sin_a = sin(a);
+                int16_t pa = (int16_t)( cos_a * (256.0 / sx * 256.0));
+                int16_t pb = (int16_t)(-sin_a * (256.0 / sx * 256.0));
+                int16_t pc = (int16_t)( sin_a * (256.0 / sy * 256.0));
+                int16_t pd = (int16_t)( cos_a * (256.0 / sy * 256.0));
+                int32_t refx = cx - (int32_t)((int64_t)pa * dx + (int64_t)pb * dy);
+                int32_t refy = cy - (int32_t)((int64_t)pc * dx + (int64_t)pd * dy);
+
+                WRITE16(dst, (uint16_t)pa); dst += 2;
+                WRITE16(dst, (uint16_t)pb); dst += 2;
+                WRITE16(dst, (uint16_t)pc); dst += 2;
+                WRITE16(dst, (uint16_t)pd); dst += 2;
+                WRITE32(dst, (uint32_t)refx); dst += 4;
+                WRITE32(dst, (uint32_t)refy); dst += 4;
+            }
+            break;
+        }
+
+        case 0x0F: { /* ObjAffineSet */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t count = cpu->r[2];
+            uint32_t offset = cpu->r[3]; /* stride in dst (typically 2 or 8) */
+
+            for (uint32_t i = 0; i < count; i++) {
+                int16_t sx = (int16_t)READ16(src); src += 2;
+                int16_t sy = (int16_t)READ16(src); src += 2;
+                uint16_t angle = READ16(src);       src += 2;
+                src += 2; /* padding */
+
+                double a = (double)angle / 65536.0 * 2.0 * 3.14159265358979;
+                double cos_a = cos(a), sin_a = sin(a);
+                int16_t pa = (int16_t)( cos_a * (256.0 * 256.0 / sx));
+                int16_t pb = (int16_t)(-sin_a * (256.0 * 256.0 / sx));
+                int16_t pc = (int16_t)( sin_a * (256.0 * 256.0 / sy));
+                int16_t pd = (int16_t)( cos_a * (256.0 * 256.0 / sy));
+
+                WRITE16(dst, (uint16_t)pa); dst += offset;
+                WRITE16(dst, (uint16_t)pb); dst += offset;
+                WRITE16(dst, (uint16_t)pc); dst += offset;
+                WRITE16(dst, (uint16_t)pd); dst += offset;
+            }
+            break;
+        }
+
+        case 0x10: { /* BitUnPack: R0=src, R1=dst, R2=info_ptr */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t info = cpu->r[2];
+            uint16_t src_len = READ16(info);
+            uint8_t src_width = READ8(info + 2);
+            uint8_t dst_width = READ8(info + 3);
+            uint32_t data_offset = READ32(info + 4);
+            bool zero_flag = (data_offset >> 31) & 1;
+            data_offset &= 0x7FFFFFFF;
+
+            if (src_width == 0 || dst_width == 0 || dst_width > 32) break;
+
+            uint32_t out_word = 0;
+            int out_bits = 0;
+            uint32_t src_mask = (1u << src_width) - 1;
+
+            uint32_t src_byte = 0;
+            int src_bits_left = 0;
+
+            for (uint16_t i = 0; i < src_len; ) {
+                if (src_bits_left == 0) {
+                    src_byte = READ8(src + i);
+                    i++;
+                    src_bits_left = 8;
+                }
+                uint32_t val = src_byte & src_mask;
+                src_byte >>= src_width;
+                src_bits_left -= src_width;
+
+                /* Apply offset: if zero_flag, add to all; else add only to non-zero */
+                if (val != 0 || zero_flag) {
+                    val += data_offset;
+                }
+
+                out_word |= (val & ((1u << dst_width) - 1)) << out_bits;
+                out_bits += dst_width;
+                if (out_bits >= 32) {
+                    WRITE32(dst, out_word);
+                    dst += 4;
+                    out_word = 0;
+                    out_bits = 0;
+                }
+            }
+            /* Flush remaining bits */
+            if (out_bits > 0) {
+                WRITE32(dst, out_word);
+            }
+            break;
+        }
+
+        case 0x11: { /* LZ77UnCompWram */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t header = READ32(src); src += 4;
+            uint32_t decomp_len = header >> 8;
+            uint32_t written = 0;
+
+            while (written < decomp_len) {
+                uint8_t flags = READ8(src++);
+                for (int bit = 7; bit >= 0 && written < decomp_len; bit--) {
+                    if (flags & (1 << bit)) {
+                        uint8_t b1 = READ8(src++);
+                        uint8_t b2 = READ8(src++);
+                        uint32_t len = ((b1 >> 4) & 0xF) + 3;
+                        uint32_t disp = ((b1 & 0xF) << 8) | b2;
+                        uint32_t ref = dst - disp - 1;
+                        for (uint32_t j = 0; j < len && written < decomp_len; j++, written++) {
+                            WRITE8(dst++, READ8(ref + j));
+                        }
+                    } else {
+                        WRITE8(dst++, READ8(src++));
+                        written++;
+                    }
+                }
+            }
+            break;
+        }
+
+        case 0x12: { /* LZ77UnCompVram — must write 16-bit to VRAM */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t header = READ32(src); src += 4;
+            uint32_t decomp_len = header >> 8;
+            if (decomp_len == 0 || decomp_len > 0x40000) break; /* sanity */
+            uint8_t *tmp = (uint8_t *)malloc(decomp_len);
+            if (!tmp) break;
+            uint32_t written = 0;
+
+            while (written < decomp_len) {
+                uint8_t flags = READ8(src++);
+                for (int bit = 7; bit >= 0 && written < decomp_len; bit--) {
+                    if (flags & (1 << bit)) {
+                        uint8_t b1 = READ8(src++);
+                        uint8_t b2 = READ8(src++);
+                        uint32_t len = ((b1 >> 4) & 0xF) + 3;
+                        uint32_t disp = ((b1 & 0xF) << 8) | b2;
+                        for (uint32_t j = 0; j < len && written < decomp_len; j++, written++) {
+                            tmp[written] = tmp[written - disp - 1];
+                        }
+                    } else {
+                        tmp[written++] = READ8(src++);
+                    }
+                }
+            }
+            /* Write to VRAM in 16-bit units */
+            for (uint32_t i = 0; i + 1 < decomp_len; i += 2) {
+                WRITE16(dst + i, tmp[i] | ((uint16_t)tmp[i + 1] << 8));
+            }
+            if (decomp_len & 1) {
+                WRITE16(dst + decomp_len - 1, tmp[decomp_len - 1]);
+            }
+            free(tmp);
+            break;
+        }
+
+        case 0x14: { /* RLUnCompWram */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t header = READ32(src); src += 4;
+            uint32_t decomp_len = header >> 8;
+            uint32_t written = 0;
+
+            while (written < decomp_len) {
+                uint8_t flag = READ8(src++);
+                if (flag & 0x80) {
+                    uint32_t len = (flag & 0x7F) + 3;
+                    uint8_t data = READ8(src++);
+                    for (uint32_t j = 0; j < len && written < decomp_len; j++, written++)
+                        WRITE8(dst++, data);
+                } else {
+                    uint32_t len = (flag & 0x7F) + 1;
+                    for (uint32_t j = 0; j < len && written < decomp_len; j++, written++)
+                        WRITE8(dst++, READ8(src++));
+                }
+            }
+            break;
+        }
+
+        case 0x15: { /* RLUnCompVram — must write 16-bit to VRAM */
+            uint32_t src = cpu->r[0];
+            uint32_t dst = cpu->r[1];
+            uint32_t header = READ32(src); src += 4;
+            uint32_t decomp_len = header >> 8;
+            if (decomp_len == 0 || decomp_len > 0x40000) break;
+            uint8_t *tmp = (uint8_t *)malloc(decomp_len);
+            if (!tmp) break;
+            uint32_t written = 0;
+
+            while (written < decomp_len) {
+                uint8_t flag = READ8(src++);
+                if (flag & 0x80) {
+                    uint32_t len = (flag & 0x7F) + 3;
+                    uint8_t data = READ8(src++);
+                    for (uint32_t j = 0; j < len && written < decomp_len; j++, written++)
+                        tmp[written] = data;
+                } else {
+                    uint32_t len = (flag & 0x7F) + 1;
+                    for (uint32_t j = 0; j < len && written < decomp_len; j++, written++)
+                        tmp[written] = READ8(src++);
+                }
+            }
+            /* Write to VRAM in 16-bit units */
+            for (uint32_t i = 0; i + 1 < decomp_len; i += 2) {
+                WRITE16(dst + i, tmp[i] | ((uint16_t)tmp[i + 1] << 8));
+            }
+            if (decomp_len & 1) {
+                WRITE16(dst + decomp_len - 1, tmp[decomp_len - 1]);
+            }
+            free(tmp);
+            break;
+        }
+
+        default:
+            /* Unimplemented SWI: silently return */
+            break;
+    }
+
+    if (do_return) {
+        swi_return(cpu);
+    }
+}
+
 /* ARM Software Interrupt */
 static uint32_t arm_swi(ARM7TDMI *cpu, uint32_t instr) {
-    (void)instr;
-    uint32_t return_addr = PC - 4;
+    uint8_t swi_num = (instr >> 16) & 0xFF;
+    uint32_t return_addr = PC; /* Next instruction (PC = inst+4 after fetch) */
+    uint32_t old_cpsr = cpu->cpsr;
     arm7_switch_mode(cpu, ARM_MODE_SVC);
-    cpu->spsr = cpu->cpsr;
+    cpu->spsr = old_cpsr;
     LR = return_addr;
     cpu->cpsr |= ARM_FLAG_I;
     cpu->cpsr &= ~ARM_FLAG_T;
-    PC = 0x08;
-    flush_pipeline(cpu);
+    hle_swi(cpu, swi_num);
     return 3;
 }
 
@@ -708,7 +1252,11 @@ static uint32_t arm_msr(ARM7TDMI *cpu, uint32_t instr) {
     if (I) {
         uint8_t imm = instr & 0xFF;
         uint8_t rot = ((instr >> 8) & 0xF) * 2;
-        val = (imm >> rot) | (imm << (32 - rot));
+        if (rot == 0) {
+            val = imm;
+        } else {
+            val = (imm >> rot) | (imm << (32 - rot));
+        }
     } else {
         val = cpu->r[instr & 0xF];
     }
@@ -729,10 +1277,11 @@ static uint32_t arm_msr(ARM7TDMI *cpu, uint32_t instr) {
         cpu->spsr = (cpu->spsr & ~mask) | (val & mask);
     } else {
         uint32_t old_cpsr = cpu->cpsr;
-        cpu->cpsr = (cpu->cpsr & ~mask) | (val & mask);
-        if ((old_cpsr & ARM_MODE_MASK) != (cpu->cpsr & ARM_MODE_MASK)) {
-            arm7_switch_mode(cpu, cpu->cpsr & ARM_MODE_MASK);
+        uint32_t new_cpsr = (cpu->cpsr & ~mask) | (val & mask);
+        if ((old_cpsr & ARM_MODE_MASK) != (new_cpsr & ARM_MODE_MASK)) {
+            arm7_switch_mode(cpu, new_cpsr & ARM_MODE_MASK);
         }
+        cpu->cpsr = new_cpsr;
     }
 
     return 1;
@@ -764,8 +1313,8 @@ static uint32_t arm_swap(ARM7TDMI *cpu, uint32_t instr) {
 static uint32_t arm_blx(ARM7TDMI *cpu, uint32_t instr) {
     int32_t offset = (int32_t)(instr << 8) >> 6;
     uint32_t h = ((instr >> 24) & 1) << 1;
-    LR = PC - 4;
-    PC += offset + h;
+    LR = PC; /* Return address = next instruction */
+    PC += offset + h + 4; /* +4 for pipeline offset */
     cpu->cpsr |= ARM_FLAG_T;
     flush_pipeline(cpu);
     return 3;
@@ -867,8 +1416,8 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
     uint16_t instr = thumb_fetch(cpu);
     uint8_t ophi = (instr >> 8) & 0xFF;
 
-    /* Format 1: Move shifted register */
-    if ((instr >> 13) == 0) {
+    /* Format 1: Move shifted register (op 0-2 only; op=3 is Format 2) */
+    if ((instr >> 13) == 0 && ((instr >> 11) & 3) < 3) {
         uint8_t op = (instr >> 11) & 3;
         uint8_t offset = (instr >> 6) & 0x1F;
         uint8_t rs = (instr >> 3) & 7;
@@ -907,9 +1456,9 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
         uint8_t rd = instr & 7;
 
         uint32_t a = cpu->r[rs];
-        uint32_t b = (op & 1) ? rn_or_imm : cpu->r[rn_or_imm];
+        uint32_t b = (op & 2) ? rn_or_imm : cpu->r[rn_or_imm];
 
-        if (op < 2) {
+        if (!(op & 1)) {
             cpu->r[rd] = add_with_carry(cpu, a, b, false, true);
         } else {
             cpu->r[rd] = sub_with_carry(cpu, a, b, true, true);
@@ -994,20 +1543,25 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
         uint8_t rd = (instr & 7) | ((instr & 0x80) ? 8 : 0);
         rs = ((instr >> 3) & 7) | ((instr & 0x40) ? 8 : 0);
 
+        uint32_t rs_val = cpu->r[rs];
+        if (rs == 15) rs_val += 2; /* Pipeline: real PC = inst+4, ours = inst+2 */
+        uint32_t rd_val = cpu->r[rd];
+        if (rd == 15) rd_val += 2;
+
         switch (op) {
             case 0: /* ADD */
-                cpu->r[rd] += cpu->r[rs];
+                cpu->r[rd] = rd_val + rs_val;
                 if (rd == 15) flush_pipeline(cpu);
                 break;
             case 1: /* CMP */
-                sub_with_carry(cpu, cpu->r[rd], cpu->r[rs], true, true);
+                sub_with_carry(cpu, rd_val, rs_val, true, true);
                 break;
             case 2: /* MOV */
-                cpu->r[rd] = cpu->r[rs];
+                cpu->r[rd] = rs_val;
                 if (rd == 15) flush_pipeline(cpu);
                 break;
             case 3: { /* BX */
-                uint32_t addr = cpu->r[rs];
+                uint32_t addr = rs_val;
                 if (addr & 1) {
                     cpu->cpsr |= ARM_FLAG_T;
                     PC = addr & ~1u;
@@ -1026,7 +1580,7 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
     if ((instr >> 11) == 0x09) {
         uint8_t rd = (instr >> 8) & 7;
         uint32_t offset = (instr & 0xFF) << 2;
-        uint32_t addr = (PC & ~3u) + offset;
+        uint32_t addr = ((PC + 2) & ~3u) + offset; /* +2: pipeline (real PC = inst+4) */
         cpu->r[rd] = READ32(addr);
         return 3;
     }
@@ -1120,7 +1674,7 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
         bool sp = (instr >> 11) & 1;
         uint8_t rd = (instr >> 8) & 7;
         uint32_t offset = (instr & 0xFF) << 2;
-        cpu->r[rd] = (sp ? SP : (PC & ~3u)) + offset;
+        cpu->r[rd] = (sp ? SP : ((PC + 2) & ~3u)) + offset;
         return 1;
     }
 
@@ -1209,7 +1763,7 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
         uint8_t cond = (instr >> 8) & 0xF;
         if (check_condition(cpu, cond)) {
             int32_t offset = (int32_t)(int8_t)(instr & 0xFF) << 1;
-            PC += offset;
+            PC += offset + 2; /* +2: pipeline (real PC = inst+4) */
             flush_pipeline(cpu);
             return 3;
         }
@@ -1218,21 +1772,28 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
 
     /* Format 17: Software interrupt (SWI) */
     if ((instr & 0xFF00) == 0xDF00) {
-        uint32_t return_addr = PC - 2;
+        uint8_t swi_num = instr & 0xFF;
+        uint32_t return_addr = PC; /* Next instruction (PC = inst+2 after fetch) */
+        uint32_t old_cpsr = cpu->cpsr;
         arm7_switch_mode(cpu, ARM_MODE_SVC);
-        cpu->spsr = cpu->cpsr;
+        cpu->spsr = old_cpsr;
         LR = return_addr;
         cpu->cpsr |= ARM_FLAG_I;
         cpu->cpsr &= ~ARM_FLAG_T;
-        PC = 0x08;
-        flush_pipeline(cpu);
+        hle_swi(cpu, swi_num);
         return 3;
     }
 
     /* Format 18: Unconditional branch */
     if ((instr >> 11) == 0x1C) {
         int32_t offset = (int32_t)(instr << 21) >> 20;
-        PC += offset;
+        static int b_trace = 0;
+        if (b_trace < 5) {
+            fprintf(stderr, "[F18] instr=0x%04X PC_before=0x%08X offset=%d PC_after=0x%08X\n",
+                instr, PC, offset, PC + offset + 2);
+            b_trace++;
+        }
+        PC += offset + 2; /* +2: pipeline */
         flush_pipeline(cpu);
         return 3;
     }
@@ -1241,13 +1802,13 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
     if ((instr >> 11) == 0x1E) {
         /* First instruction: LR = PC + (offset << 12) */
         int32_t offset = (int32_t)(instr << 21) >> 9;
-        LR = PC + offset;
+        LR = PC + 2 + offset; /* +2: pipeline (real PC = inst+4) */
         return 1;
     }
     if ((instr >> 11) == 0x1F) {
         /* Second instruction: PC = LR + (offset << 1), LR = old PC | 1 */
         uint32_t offset = (instr & 0x7FF) << 1;
-        uint32_t temp = PC - 2;
+        uint32_t temp = PC; /* Next instruction address */
         PC = (LR + offset) & ~1u;
         LR = temp | 1;
         flush_pipeline(cpu);
@@ -1261,12 +1822,90 @@ static uint32_t thumb_execute(ARM7TDMI *cpu) {
 /* ---------- Main step ---------- */
 
 uint32_t arm7_step(ARM7TDMI *cpu) {
+    static int irq_trace = 0;
+    static int irq_loop_trace = 0;
+    static int arm_misaligned_trace = 0;
+    static int intrwait_wake_trace = 0;
+
+    if (cpu->intrwait_active) {
+        uint8_t mode = cpu->cpsr & ARM_MODE_MASK;
+        if (mode == ARM_MODE_SVC) {
+            uint16_t bios_if = READ16(0x03007FF8);
+            if (bios_if & cpu->intrwait_flags) {
+                if (intrwait_wake_trace < 30) {
+                    fprintf(stderr,
+                        "[INTRWAIT_WAKE %d] PC=0x%08X CPSR=0x%08X SPSR=0x%08X IF_BIOS=0x%04X flags=0x%04X LR=0x%08X\n",
+                        intrwait_wake_trace, PC, cpu->cpsr, cpu->spsr, bios_if,
+                        cpu->intrwait_flags, LR);
+                    intrwait_wake_trace++;
+                }
+                /* Clear matched flags in BIOS IF (GBATEK: "automatically cleared") */
+                bios_if &= ~cpu->intrwait_flags;
+                WRITE16(0x03007FF8, bios_if);
+
+                cpu->intrwait_active = false;
+                cpu->halted = false;
+                swi_return(cpu);
+            } else {
+                static int intrwait_poll_trace = 0;
+                if (intrwait_poll_trace < 30) {
+                    fprintf(stderr, "[INTRWAIT_POLL %d] PC=0x%08X BIOS_IF=0x%04X flags=0x%04X iwram[7FF8]=0x%02X%02X\n",
+                        intrwait_poll_trace, PC, bios_if, cpu->intrwait_flags,
+                        cpu->read8(cpu->mem_ctx, 0x03007FF9),
+                        cpu->read8(cpu->mem_ctx, 0x03007FF8));
+                    intrwait_poll_trace++;
+                }
+                /* SWI wait blocks only while still in SVC context. */
+                cpu->halted = true;
+            }
+        } else {
+            /* IRQ handler (or resumed caller) must be allowed to execute. */
+            cpu->halted = false;
+        }
+    }
+
     if (cpu->halted) {
         arm7_check_interrupts(cpu);
+        cpu->cycles += 1;
+        cpu->total_cycles += 1;
         return 1;
     }
 
     arm7_check_interrupts(cpu);
+
+        if (((cpu->cpsr & ARM_MODE_MASK) == ARM_MODE_IRQ) && !(cpu->cpsr & ARM_FLAG_T)
+            && PC >= 0x03001BF0 && PC < 0x03001D40 && irq_loop_trace < 220) {
+        uint32_t instr = cpu->read32(cpu->mem_ctx, PC);
+        fprintf(stderr, "[IRQ_LOOP %d] PC=0x%08X instr=0x%08X LR=0x%08X SP=0x%08X CPSR=0x%08X\n",
+            irq_loop_trace, PC, instr, LR, SP, cpu->cpsr);
+        irq_loop_trace++;
+    }
+
+    /* Trace first instructions after VBlankIntrWait returns */
+    if (vbl_swi_done >= 1 && post_vbl_traced < 1200) {
+        uint32_t pc_before = PC;
+        if (IS_THUMB()) {
+            uint16_t instr = cpu->read16(cpu->mem_ctx, pc_before);
+            fprintf(stderr, "[POST_VBL %d] T 0x%08X: 0x%04X R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X LR=0x%08X SP=0x%08X mode=%d\n",
+                post_vbl_traced, pc_before, instr,
+                cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3],
+                cpu->r[14], cpu->r[13], cpu->cpsr & 0x1F);
+        } else {
+            uint32_t instr = cpu->read32(cpu->mem_ctx, pc_before);
+            fprintf(stderr, "[POST_VBL %d] A 0x%08X: 0x%08X R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X LR=0x%08X SP=0x%08X mode=%d\n",
+                post_vbl_traced, pc_before, instr,
+                cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3],
+                cpu->r[14], cpu->r[13], cpu->cpsr & 0x1F);
+        }
+        post_vbl_traced++;
+    }
+
+    if (!IS_THUMB() && (PC & 3u) && arm_misaligned_trace < 24) {
+        uint32_t instr = cpu->read32(cpu->mem_ctx, PC);
+        fprintf(stderr, "[ARM_MISALIGN %d] PC=0x%08X instr=0x%08X LR=0x%08X SP=0x%08X CPSR=0x%08X\n",
+            arm_misaligned_trace, PC, instr, LR, SP, cpu->cpsr);
+        arm_misaligned_trace++;
+    }
 
     uint32_t cycles;
     if (IS_THUMB()) {
@@ -1287,7 +1926,8 @@ size_t arm7_serialize(const ARM7TDMI *cpu, uint8_t *buf, size_t buf_size) {
     size_t needed = sizeof(cpu->r) + sizeof(cpu->cpsr) + sizeof(cpu->spsr)
                   + sizeof(cpu->fiq_r8_r12) + sizeof(uint32_t) * 14 /* banked */
                   + sizeof(cpu->usr_r8_r12) + sizeof(cpu->halted)
-                  + sizeof(cpu->cycles) + sizeof(cpu->total_cycles) + 64;
+                  + sizeof(cpu->cycles) + sizeof(cpu->total_cycles)
+                  + sizeof(cpu->intrwait_active) + sizeof(cpu->intrwait_flags) + 64;
     if (!buf || buf_size < needed) return needed;
 
     size_t pos = 0;
@@ -1301,6 +1941,7 @@ size_t arm7_serialize(const ARM7TDMI *cpu, uint8_t *buf, size_t buf_size) {
     S(und_r13); S(und_r14); S(und_spsr);
     S(usr_r13); S(usr_r14);
     S(halted); S(cycles); S(total_cycles);
+    S(intrwait_active); S(intrwait_flags);
     #undef S
     return pos;
 }
@@ -1318,6 +1959,7 @@ size_t arm7_deserialize(ARM7TDMI *cpu, const uint8_t *buf, size_t buf_size) {
     L(und_r13); L(und_r14); L(und_spsr);
     L(usr_r13); L(usr_r14);
     L(halted); L(cycles); L(total_cycles);
+    L(intrwait_active); L(intrwait_flags);
     #undef L
     cpu->pipeline_valid = false;
     return pos;

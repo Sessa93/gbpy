@@ -153,10 +153,11 @@ static void parse_gba_header(Cartridge *cart) {
     hdr->complement = rom[0xBD];
     hdr->rom_size = (uint32_t)cart->rom_size;
 
-    /* GBA SRAM/Flash: typically 32KB or 64KB */
+    /* GBA SRAM/Flash: typically 32KB, 64KB, or 128KB */
     /* Detect by searching for strings in ROM */
     cart->has_battery = false;
     cart->ram_size = 0;
+    cart->gba_save_type = GBA_SAVE_NONE;
 
     /* Search for save type strings in the ROM */
     const char *sram_str = "SRAM_V";
@@ -169,26 +170,31 @@ static void parse_gba_header(Cartridge *cart) {
         if (memcmp(&rom[i], flash1m_str, 9) == 0) {
             cart->ram_size = 128 * 1024;
             cart->has_battery = true;
+            cart->gba_save_type = GBA_SAVE_FLASH_128K;
             break;
         }
         if (memcmp(&rom[i], flash512_str, 10) == 0) {
             cart->ram_size = 64 * 1024;
             cart->has_battery = true;
+            cart->gba_save_type = GBA_SAVE_FLASH_64K;
             break;
         }
         if (memcmp(&rom[i], flash_str, 7) == 0) {
             cart->ram_size = 64 * 1024;
             cart->has_battery = true;
+            cart->gba_save_type = GBA_SAVE_FLASH_64K;
             break;
         }
         if (memcmp(&rom[i], sram_str, 6) == 0) {
             cart->ram_size = 32 * 1024;
             cart->has_battery = true;
+            cart->gba_save_type = GBA_SAVE_SRAM;
             break;
         }
         if (memcmp(&rom[i], eeprom_str, 8) == 0) {
             cart->ram_size = 8 * 1024; /* Default to 8KB EEPROM */
             cart->has_battery = true;
+            cart->gba_save_type = GBA_SAVE_EEPROM;
             break;
         }
     }

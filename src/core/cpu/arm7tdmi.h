@@ -118,6 +118,10 @@ typedef struct ARM7TDMI {
     bool irq_pending;
     bool fiq_pending;
 
+    /* BIOS IntrWait/VBlankIntrWait state */
+    bool intrwait_active;
+    uint16_t intrwait_flags;
+
     /* Memory callbacks */
     arm7_read8_fn read8;
     arm7_read16_fn read16;

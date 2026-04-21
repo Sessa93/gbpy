@@ -77,8 +77,17 @@ typedef struct GbaMemory {
     /* Cartridge */
     uint8_t *rom;                  /* ROM data pointer */
     uint32_t rom_size;             /* ROM size in bytes */
-    uint8_t sram[0x10000];         /* 64KB SRAM/Flash */
+    uint8_t sram[0x20000];         /* 128KB SRAM/Flash */
     uint32_t sram_size;
+
+    /* Flash emulation state machine */
+    uint8_t flash_state;           /* Current Flash command state */
+    uint8_t flash_bank;            /* Bank select for 128KB Flash (0 or 1) */
+    bool flash_id_mode;            /* In chip identification mode */
+    bool flash_write_enable;       /* Single byte write pending */
+    bool flash_is_flash;           /* Save type is Flash (vs plain SRAM) */
+    uint8_t flash_manufacturer;    /* Manufacturer ID (e.g. 0x62 for Sanyo) */
+    uint8_t flash_device;          /* Device ID (e.g. 0x13 for Sanyo 128KB) */
 
     /* DMA channels */
     GbaDMA dma[4];

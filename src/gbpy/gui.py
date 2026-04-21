@@ -178,6 +178,8 @@ class EmulatorWindow(QMainWindow):
             painter.end()
 
     def keyPressEvent(self, event: QKeyEvent):
+        if event.isAutoRepeat():
+            return
         key = event.key()
         if key in KEY_MAP:
             self.emu.button_press(KEY_MAP[key])
@@ -185,6 +187,8 @@ class EmulatorWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent):
+        if event.isAutoRepeat():
+            return
         key = event.key()
         if key in KEY_MAP:
             self.emu.button_release(KEY_MAP[key])

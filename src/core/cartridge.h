@@ -53,6 +53,15 @@ typedef struct {
     uint32_t rom_size;      /* Calculated from file size */
 } GbaCartHeader;
 
+/* GBA save type detection */
+typedef enum {
+    GBA_SAVE_NONE = 0,
+    GBA_SAVE_SRAM,
+    GBA_SAVE_FLASH_64K,
+    GBA_SAVE_FLASH_128K,
+    GBA_SAVE_EEPROM
+} GbaSaveType;
+
 /* Unified cartridge */
 typedef struct {
     CartType type;
@@ -70,6 +79,7 @@ typedef struct {
     char save_path[512];
     bool has_battery;
     bool has_rtc;
+    GbaSaveType gba_save_type;
 } Cartridge;
 
 /* API */

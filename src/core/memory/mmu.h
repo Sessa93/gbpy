@@ -66,6 +66,10 @@ typedef struct MMU {
     bool dma_active;
     uint16_t dma_source;
     uint8_t dma_offset;
+
+    /* Serial output capture (for test ROMs) */
+    char serial_buf[4096];
+    uint32_t serial_pos;
 } MMU;
 
 /* Initialize/destroy */

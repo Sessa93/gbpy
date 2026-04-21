@@ -82,6 +82,7 @@ typedef struct GbPPU {
     uint8_t line;               /* Current scanline (LY) */
     uint8_t window_line;        /* Internal window line counter */
     bool frame_ready;           /* True when a complete frame is drawn */
+    bool stat_irq_line;         /* Previous STAT IRQ line state (for edge detection) */
 
     /* GBC color palettes (Section 2.8.6) */
     uint8_t bg_palette_data[64];   /* 8 palettes * 4 colors * 2 bytes */
